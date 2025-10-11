@@ -12,6 +12,7 @@ import os
 import functools
 import fire
 from datetime import datetime
+import json
 
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
@@ -95,8 +96,19 @@ class C4DualStreamCollator:
             return_tensors='pt'
         )
         
+        # Shift labels: predict next token, not current
         labels_A = encoded_A['input_ids'].clone()
         labels_B = encoded_B['input_ids'].clone()
+        
+        # Shift left: labels[i] = input_ids[i+1]
+        labels_A[:, :-1] = encoded_A['input_ids'][:, 1:]
+        labels_B[:, :-1] = encoded_B['input_ids'][:, 1:]
+        
+        # Last position has no next token, so ignore it
+        labels_A[:, -1] = -100
+        labels_B[:, -1] = -100
+        
+        # Also ignore padding tokens
         labels_A[labels_A == self.tokenizer.pad_token_id] = -100
         labels_B[labels_B == self.tokenizer.pad_token_id] = -100
         
@@ -150,6 +162,75 @@ def compute_weight_distance(weight_A, weight_B):
     frobenius_norm = torch.norm(diff, p='fro')
     normalized_distance = frobenius_norm / (weight_A.numel() ** 0.5)
     return normalized_distance.item()
+
+
+def load_live_config(config_path):
+    """Load live configuration from JSON file."""
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Failed to load live config: {e}")
+    return None
+
+
+def create_initial_live_config(config_path, learning_rate, backbone_lr, temperature, 
+                                log_interval, similarity_log_interval, eval_interval):
+    """Create initial live configuration file."""
+    config = {
+        "learning_rate": learning_rate,
+        "backbone_lr": backbone_lr,
+        "temperature": temperature,
+        "log_interval": log_interval,
+        "similarity_log_interval": similarity_log_interval,
+        "eval_interval": eval_interval
+    }
+    with open(config_path, 'w') as f:
+        json.dump(config, indent=2, fp=f)
+    return config
+
+
+def apply_config_changes(current_config, new_config, optimizer, embedding_params, 
+                         backbone_params, freeze_backbone):
+    """Apply configuration changes and return dict of what changed."""
+    changes = {}
+    
+    # Check and apply learning rate changes
+    if "learning_rate" in new_config and new_config["learning_rate"] != current_config["learning_rate"]:
+        old_lr = current_config["learning_rate"]
+        new_lr = new_config["learning_rate"]
+        # Update optimizer learning rate for embedding parameters
+        optimizer.param_groups[0]['lr'] = new_lr
+        current_config["learning_rate"] = new_lr
+        changes["learning_rate"] = (old_lr, new_lr)
+    
+    # Check and apply backbone learning rate changes (if not frozen)
+    if not freeze_backbone and "backbone_lr" in new_config and new_config["backbone_lr"] != current_config["backbone_lr"]:
+        old_lr = current_config["backbone_lr"]
+        new_lr = new_config["backbone_lr"]
+        # Update optimizer learning rate for backbone parameters (second param group)
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[1]['lr'] = new_lr
+        current_config["backbone_lr"] = new_lr
+        changes["backbone_lr"] = (old_lr, new_lr)
+    
+    # Check and apply temperature changes
+    if "temperature" in new_config and new_config["temperature"] != current_config["temperature"]:
+        old_temp = current_config["temperature"]
+        new_temp = new_config["temperature"]
+        current_config["temperature"] = new_temp
+        changes["temperature"] = (old_temp, new_temp)
+    
+    # Check and apply interval changes
+    for interval_name in ["log_interval", "similarity_log_interval", "eval_interval"]:
+        if interval_name in new_config and new_config[interval_name] != current_config[interval_name]:
+            old_val = current_config[interval_name]
+            new_val = new_config[interval_name]
+            current_config[interval_name] = new_val
+            changes[interval_name] = (old_val, new_val)
+    
+    return changes
 
 
 def generate_samples(model, tokenizer, prompts, device, max_new_tokens=50, temperature=0.7):
@@ -213,16 +294,16 @@ def generate_samples(model, tokenizer, prompts, device, max_new_tokens=50, tempe
 def train(
     model_name='unsloth/Llama-3.2-1B',
     device=None,
-    batch_size=2,
+    batch_size=4,
     learning_rate=1e-4,
     backbone_lr=1e-5,
     freeze_backbone=True,
     num_train_steps=50_000,
-    max_length=2048,
+    max_length=4096,
     log_interval=1,
     similarity_log_interval=50,
     eval_interval=500,
-    save_interval=5_000,
+    save_interval=10_000,
     max_gen_tokens=50,
     temperature=0.7,
     output_dir='./checkpoints',
@@ -247,15 +328,43 @@ def train(
         temperature: Sampling temperature for generation (higher = more random)
         output_dir: Output directory for checkpoints
         tensorboard_log_dir: Tensorboard log directory. Set to empty string to disable tensorboard logging.
+    
+    Live Configuration:
+        A live_config.json file is created in the run directory. You can edit this file during training
+        to adjust hyperparameters in real-time. Changes are checked every 10 steps. Supported parameters:
+        - learning_rate: Learning rate for embeddings/unembeddings
+        - backbone_lr: Learning rate for backbone (if not frozen)
+        - temperature: Sampling temperature for generation
+        - log_interval: How often to log metrics
+        - similarity_log_interval: How often to log weight similarities
+        - eval_interval: How often to run generation samples
     """
+    # Create unique subdirectory for this run with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"run_{timestamp}"
+    
+    # Create run-specific checkpoint directory
+    output_dir = os.path.join(output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
     
-    # Create unique subdirectory for this run with timestamp
+    # Create run-specific tensorboard directory
     if tensorboard_log_dir:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_name = f"run_{timestamp}"
         tensorboard_log_dir = os.path.join(tensorboard_log_dir, run_name)
         os.makedirs(tensorboard_log_dir, exist_ok=True)
+    
+    # Create live config file for runtime parameter adjustments
+    live_config_path = os.path.join(output_dir, 'live_config.json')
+    live_config = {
+        "learning_rate": learning_rate,
+        "backbone_lr": backbone_lr,
+        "temperature": temperature,
+        "log_interval": log_interval,
+        "similarity_log_interval": similarity_log_interval,
+        "eval_interval": eval_interval
+    }
+    create_initial_live_config(live_config_path, learning_rate, backbone_lr, temperature,
+                               log_interval, similarity_log_interval, eval_interval)
+    live_config_check_interval = 10  # Check for config changes every N steps
     
     rank, world_size, local_rank = setup_distributed(device)
     
@@ -274,6 +383,7 @@ def train(
         print(f"Learning rate (backbone): {backbone_lr if not freeze_backbone else 'N/A (frozen)'}")
         print(f"Freeze backbone: {freeze_backbone}")
         print(f"Number of training steps: {num_train_steps}")
+        print(f"Live config path: {live_config_path}")
         
         if tensorboard_log_dir:
             writer = SummaryWriter(log_dir=tensorboard_log_dir)
@@ -281,8 +391,8 @@ def train(
             
             writer.add_text('config/model_name', model_name)
             writer.add_scalar('config/batch_size', batch_size)
-            writer.add_scalar('config/learning_rate', learning_rate)
-            writer.add_scalar('config/backbone_lr', backbone_lr)
+            writer.add_scalar('config/learning_rate_initial', learning_rate)
+            writer.add_scalar('config/backbone_lr_initial', backbone_lr)
             writer.add_scalar('config/freeze_backbone', 1 if freeze_backbone else 0)
             writer.add_scalar('config/num_train_steps', num_train_steps)
             writer.add_scalar('config/max_length', max_length)
@@ -306,9 +416,7 @@ def train(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size * 2,
-        collate_fn=collate_fn,
-        num_workers=2,
-        prefetch_factor=2
+        collate_fn=collate_fn
     )
     
     base_model_config = AutoConfig.from_pretrained(model_name)
@@ -380,7 +488,7 @@ def train(
         print("Initial generation samples (step 0 - before training)")
         print('='*80)
         
-        samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=temperature)
+        samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=live_config['temperature'])
         
         for i, sample in enumerate(samples, 1):
             print(f"\nSample {i}:")
@@ -433,6 +541,33 @@ def train(
         loss.backward()
         optimizer.step()
         
+        # Check for live config changes
+        if rank == 0 and (step + 1) % live_config_check_interval == 0:
+            new_config = load_live_config(live_config_path)
+            if new_config is not None:
+                changes = apply_config_changes(
+                    live_config, new_config, optimizer, embedding_params, 
+                    model.backbone.parameters() if not isinstance(model, FSDP) else model.module.backbone.parameters(),
+                    freeze_backbone
+                )
+                
+                if changes:
+                    change_description = ", ".join([f"{k}: {v[0]} -> {v[1]}" for k, v in changes.items()])
+                    print(f"\n{'='*80}")
+                    print(f"[Step {step+1}] Configuration changed: {change_description}")
+                    print(f"{'='*80}\n")
+                    
+                    if writer is not None:
+                        # Log the change event
+                        event_text = f"Step {step+1}: {change_description}"
+                        writer.add_text('events/config_changes', event_text, step + 1)
+                        writer.flush()
+                
+                # Update intervals from live config
+                log_interval = live_config.get("log_interval", log_interval)
+                similarity_log_interval = live_config.get("similarity_log_interval", similarity_log_interval)
+                eval_interval = live_config.get("eval_interval", eval_interval)
+        
         if rank == 0 and (step + 1) % log_interval == 0:
             print(f"Step {step+1}/{num_train_steps} | "
                   f"Total Loss: {loss.item():.4f} | "
@@ -443,6 +578,12 @@ def train(
                 writer.add_scalar('train/loss_total', loss.item(), step + 1)
                 writer.add_scalar('train/loss_A', loss_A.item(), step + 1)
                 writer.add_scalar('train/loss_B', loss_B.item(), step + 1)
+                
+                # Log current hyperparameters
+                writer.add_scalar('hyperparams/learning_rate', live_config['learning_rate'], step + 1)
+                writer.add_scalar('hyperparams/backbone_lr', live_config['backbone_lr'], step + 1)
+                writer.add_scalar('hyperparams/temperature', live_config['temperature'], step + 1)
+                
                 writer.flush()
         
         if rank == 0 and (step + 1) % similarity_log_interval == 0:
@@ -473,7 +614,7 @@ def train(
             print(f"Generation samples at step {step+1}")
             print('='*80)
             
-            samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=temperature)
+            samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=live_config['temperature'])
             
             for i, sample in enumerate(samples, 1):
                 print(f"\nSample {i}:")
