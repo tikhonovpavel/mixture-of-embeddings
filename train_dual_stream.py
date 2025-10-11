@@ -13,8 +13,21 @@ import functools
 import fire
 from datetime import datetime
 import json
+import random
+import numpy as np
 
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+
+
+def set_seed(seed):
+    """Set seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Make CuDNN deterministic (may reduce performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class DualStreamLLM(nn.Module):
@@ -306,8 +319,15 @@ def train(
     save_interval=10_000,
     max_gen_tokens=50,
     temperature=0.7,
+    seed=42,
     output_dir='./checkpoints',
-    tensorboard_log_dir='./tensorboard_logs'
+    tensorboard_log_dir='./tensorboard_logs',
+    # Loss balancing parameters
+    loss_balance_strength=1.0,
+    loss_balance_ema_momentum=0.99,
+    loss_balance_warmup_steps=100,
+    loss_balance_clip_min=0.1,
+    loss_balance_clip_max=10.0
 ):
     """Train Dual-Stream LLM.
     
@@ -326,8 +346,14 @@ def train(
         save_interval: Checkpoint save interval
         max_gen_tokens: Maximum tokens to generate during evaluation
         temperature: Sampling temperature for generation (higher = more random)
+        seed: Random seed for reproducibility
         output_dir: Output directory for checkpoints
         tensorboard_log_dir: Tensorboard log directory. Set to empty string to disable tensorboard logging.
+        loss_balance_strength: Strength of loss balancing (higher = more aggressive)
+        loss_balance_ema_momentum: EMA momentum for loss tracking (0.99 = smooth, 0.9 = responsive)
+        loss_balance_warmup_steps: Steps before enabling loss balancing
+        loss_balance_clip_min: Minimum value for alpha/beta coefficients
+        loss_balance_clip_max: Maximum value for alpha/beta coefficients
     
     Live Configuration:
         A live_config.json file is created in the run directory. You can edit this file during training
@@ -339,6 +365,9 @@ def train(
         - similarity_log_interval: How often to log weight similarities
         - eval_interval: How often to run generation samples
     """
+    # Set seed for reproducibility
+    set_seed(seed)
+    
     # Create unique subdirectory for this run with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"run_{timestamp}"
@@ -383,11 +412,22 @@ def train(
         print(f"Learning rate (backbone): {backbone_lr if not freeze_backbone else 'N/A (frozen)'}")
         print(f"Freeze backbone: {freeze_backbone}")
         print(f"Number of training steps: {num_train_steps}")
+        print(f"Seed: {seed}")
         print(f"Live config path: {live_config_path}")
         
         if tensorboard_log_dir:
             writer = SummaryWriter(log_dir=tensorboard_log_dir)
             print(f"Tensorboard logging enabled: {tensorboard_log_dir}")
+            
+            # Save script version to tensorboard
+            script_path = __file__
+            try:
+                with open(script_path, 'r', encoding='utf-8') as f:
+                    script_content = f.read()
+                writer.add_text('script_version/train_dual_stream.py', f"```python\n{script_content}\n```")
+                print(f"Script version saved to tensorboard")
+            except Exception as e:
+                print(f"Warning: Failed to save script version: {e}")
             
             writer.add_text('config/model_name', model_name)
             writer.add_scalar('config/batch_size', batch_size)
@@ -396,7 +436,13 @@ def train(
             writer.add_scalar('config/freeze_backbone', 1 if freeze_backbone else 0)
             writer.add_scalar('config/num_train_steps', num_train_steps)
             writer.add_scalar('config/max_length', max_length)
+            writer.add_scalar('config/seed', seed)
             writer.add_scalar('config/world_size', world_size)
+            writer.add_scalar('config/loss_balance_strength', loss_balance_strength)
+            writer.add_scalar('config/loss_balance_ema_momentum', loss_balance_ema_momentum)
+            writer.add_scalar('config/loss_balance_warmup_steps', loss_balance_warmup_steps)
+            writer.add_scalar('config/loss_balance_clip_min', loss_balance_clip_min)
+            writer.add_scalar('config/loss_balance_clip_max', loss_balance_clip_max)
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
@@ -408,8 +454,8 @@ def train(
         ("The history of", "Modern technology enables")
     ]
     
-    dataset = load_dataset('c4', 'en', split='train', streaming=True, trust_remote_code=True)
-    dataset = dataset.shuffle(seed=42, buffer_size=10000)
+    dataset = load_dataset('allenai/c4', 'en', split='train', streaming=True, trust_remote_code=True)
+    dataset = dataset.shuffle(seed=seed, buffer_size=10000)
     
     collate_fn = C4DualStreamCollator(tokenizer, max_length=max_length)
     
@@ -480,6 +526,19 @@ def train(
     
     loss_fn = nn.CrossEntropyLoss()
     
+    # Initialize loss balancing variables
+    ema_loss_A = None
+    ema_loss_B = None
+    alpha = 1.0
+    beta = 1.0
+    
+    if rank == 0:
+        print(f"\nLoss balancing configuration:")
+        print(f"  Strength: {loss_balance_strength}")
+        print(f"  EMA momentum: {loss_balance_ema_momentum}")
+        print(f"  Warmup steps: {loss_balance_warmup_steps}")
+        print(f"  Clip range: [{loss_balance_clip_min}, {loss_balance_clip_max}]")
+    
     model.train()
     data_iter = iter(dataloader)
     
@@ -514,6 +573,17 @@ def train(
             
             table_markdown = table_header + table_rows
             writer.add_text(f'generation_samples/step_{0:07d}', table_markdown, 0)
+            
+            # Log initial hyperparameters
+            writer.add_scalar('hyperparams/learning_rate', live_config['learning_rate'], 0)
+            writer.add_scalar('hyperparams/backbone_lr', live_config['backbone_lr'], 0)
+            writer.add_scalar('hyperparams/temperature', live_config['temperature'], 0)
+            
+            # Log initial loss balancing coefficients
+            writer.add_scalar('loss_balance/alpha', alpha, 0)
+            writer.add_scalar('loss_balance/beta', beta, 0)
+            writer.add_scalar('loss_balance/alpha_beta_ratio', alpha / beta if beta > 0 else 0, 0)
+            
             writer.flush()
     
     for step in range(num_train_steps):
@@ -536,7 +606,35 @@ def train(
         
         loss_A = loss_fn(logits_A.view(-1, logits_A.size(-1)), labels_A.view(-1))
         loss_B = loss_fn(logits_B.view(-1, logits_B.size(-1)), labels_B.view(-1))
-        loss = loss_A + loss_B
+        
+        # Update EMA for loss balancing
+        if ema_loss_A is None:
+            ema_loss_A = loss_A.item()
+            ema_loss_B = loss_B.item()
+        else:
+            ema_loss_A = loss_balance_ema_momentum * ema_loss_A + (1 - loss_balance_ema_momentum) * loss_A.item()
+            ema_loss_B = loss_balance_ema_momentum * ema_loss_B + (1 - loss_balance_ema_momentum) * loss_B.item()
+        
+        # Compute loss balancing coefficients after warmup
+        if step >= loss_balance_warmup_steps:
+            # Compute weights based on EMA losses
+            total_loss = ema_loss_A + ema_loss_B
+            weight_A = (ema_loss_A / total_loss) ** loss_balance_strength
+            weight_B = (ema_loss_B / total_loss) ** loss_balance_strength
+            
+            # Normalize so alpha + beta = 2
+            norm = weight_A + weight_B
+            alpha = weight_A / norm * 2.0
+            beta = weight_B / norm * 2.0
+            
+            # Apply clipping
+            alpha = torch.clamp(torch.tensor(alpha), loss_balance_clip_min, loss_balance_clip_max).item()
+            beta = torch.clamp(torch.tensor(beta), loss_balance_clip_min, loss_balance_clip_max).item()
+        else:
+            alpha = 1.0
+            beta = 1.0
+        
+        loss = alpha * loss_A + beta * loss_B
         
         loss.backward()
         optimizer.step()
@@ -558,9 +656,18 @@ def train(
                     print(f"{'='*80}\n")
                     
                     if writer is not None:
-                        # Log the change event
+                        # Log the change event as text
                         event_text = f"Step {step+1}: {change_description}"
                         writer.add_text('events/config_changes', event_text, step + 1)
+                        
+                        # Log changed hyperparameters as scalars for graph visualization
+                        if 'learning_rate' in changes:
+                            writer.add_scalar('hyperparams/learning_rate', changes['learning_rate'][1], step + 1)
+                        if 'backbone_lr' in changes:
+                            writer.add_scalar('hyperparams/backbone_lr', changes['backbone_lr'][1], step + 1)
+                        if 'temperature' in changes:
+                            writer.add_scalar('hyperparams/temperature', changes['temperature'][1], step + 1)
+                        
                         writer.flush()
                 
                 # Update intervals from live config
@@ -572,18 +679,19 @@ def train(
             print(f"Step {step+1}/{num_train_steps} | "
                   f"Total Loss: {loss.item():.4f} | "
                   f"Loss A: {loss_A.item():.4f} | "
-                  f"Loss B: {loss_B.item():.4f}")
+                  f"Loss B: {loss_B.item():.4f} | "
+                  f"Alpha: {alpha:.4f} | "
+                  f"Beta: {beta:.4f}")
             
             if writer is not None:
                 writer.add_scalar('train/loss_total', loss.item(), step + 1)
                 writer.add_scalar('train/loss_A', loss_A.item(), step + 1)
                 writer.add_scalar('train/loss_B', loss_B.item(), step + 1)
-                
-                # Log current hyperparameters
-                writer.add_scalar('hyperparams/learning_rate', live_config['learning_rate'], step + 1)
-                writer.add_scalar('hyperparams/backbone_lr', live_config['backbone_lr'], step + 1)
-                writer.add_scalar('hyperparams/temperature', live_config['temperature'], step + 1)
-                
+                writer.add_scalar('train/ema_loss_A', ema_loss_A, step + 1)
+                writer.add_scalar('train/ema_loss_B', ema_loss_B, step + 1)
+                writer.add_scalar('loss_balance/alpha', alpha, step + 1)
+                writer.add_scalar('loss_balance/beta', beta, step + 1)
+                writer.add_scalar('loss_balance/alpha_beta_ratio', alpha / beta if beta > 0 else 0, step + 1)
                 writer.flush()
         
         if rank == 0 and (step + 1) % similarity_log_interval == 0:
@@ -655,6 +763,10 @@ def train(
                 'step': step + 1,
                 'model_state_dict': state_dict,
                 'optimizer_state_dict': optimizer.state_dict(),
+                'alpha': alpha,
+                'beta': beta,
+                'ema_loss_A': ema_loss_A,
+                'ema_loss_B': ema_loss_B,
             }, os.path.join(checkpoint_dir, 'model.pt'))
             
             print(f"Checkpoint saved at step {step+1}")
