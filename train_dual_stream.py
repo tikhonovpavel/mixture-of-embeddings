@@ -15,6 +15,7 @@ from datetime import datetime
 import json
 import random
 import numpy as np
+from tensorboard.backend.event_processing import event_accumulator
 
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
@@ -40,18 +41,18 @@ class DualStreamLLM(nn.Module):
             use_cache=False
         )
         
-        original_embed_weights = self.backbone.get_input_embeddings().weight.data.clone()
-        original_lm_head_weights = self.backbone.get_output_embeddings().weight.data.clone()
-        
+        # Random initialization for embeddings and unembeddings
         self.emb_A = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
         self.emb_B = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
-        self.emb_A.weight.data.copy_(original_embed_weights)
-        self.emb_B.weight.data.copy_(original_embed_weights)
         
         self.unemb_A = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
         self.unemb_B = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
-        self.unemb_A.weight.data.copy_(original_lm_head_weights)
-        self.unemb_B.weight.data.copy_(original_lm_head_weights + torch.randn_like(original_lm_head_weights) * 0.01)
+        
+        # Initialize with normal distribution (std=0.02 is common for embeddings)
+        nn.init.normal_(self.emb_A.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.emb_B.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.unemb_A.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.unemb_B.weight, mean=0.0, std=0.02)
         
         if freeze_backbone:
             for param in self.backbone.parameters():
@@ -61,7 +62,7 @@ class DualStreamLLM(nn.Module):
         embeds_A = self.emb_A(input_ids_A)
         embeds_B = self.emb_B(input_ids_B)
         
-        fused_embeds = embeds_A + embeds_B
+        fused_embeds = (embeds_A + embeds_B) * 0.5
         
         attention_mask = attention_mask_A * attention_mask_B
         
@@ -161,6 +162,103 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in a directory."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    
+    checkpoint_dirs = [d for d in os.listdir(checkpoint_dir) 
+                      if d.startswith('checkpoint-') and os.path.isdir(os.path.join(checkpoint_dir, d))]
+    
+    if not checkpoint_dirs:
+        return None
+    
+    # Extract step numbers and find the latest
+    steps = []
+    for d in checkpoint_dirs:
+        try:
+            step = int(d.split('-')[1])
+            steps.append((step, d))
+        except (IndexError, ValueError):
+            continue
+    
+    if not steps:
+        return None
+    
+    latest_step, latest_dir = max(steps, key=lambda x: x[0])
+    checkpoint_path = os.path.join(checkpoint_dir, latest_dir, 'model.pt')
+    
+    if os.path.exists(checkpoint_path):
+        return checkpoint_path, latest_step
+    
+    return None
+
+
+def copy_tensorboard_events_to_new_run(source_dir, target_writer, max_step, rank=0):
+    """Copy TensorBoard events from source to target writer up to max_step."""
+    if rank != 0:
+        return  # Only main process does this
+    
+    print(f"\n{'='*80}")
+    print(f"Copying TensorBoard events from previous run...")
+    print(f"Source: {source_dir}")
+    print(f"Max step: {max_step}")
+    print('='*80)
+    
+    try:
+        ea = event_accumulator.EventAccumulator(str(source_dir))
+        ea.Reload()
+        
+        # Copy scalars
+        scalar_tags = ea.Tags().get('scalars', [])
+        print(f"Copying {len(scalar_tags)} scalar tags...")
+        
+        total_scalar_events = 0
+        for tag in scalar_tags:
+            events = ea.Scalars(tag)
+            for event in events:
+                if event.step <= max_step:
+                    target_writer.add_scalar(tag, event.value, event.step, walltime=event.wall_time)
+                    total_scalar_events += 1
+        
+        print(f"  → Copied {total_scalar_events} scalar events")
+        
+        # Copy text/tensor events (including generation samples, script version, etc.)
+        tensor_tags = ea.Tags().get('tensors', [])
+        if tensor_tags:
+            print(f"Copying {len(tensor_tags)} text/tensor tags...")
+            total_text_events = 0
+            for tag in tensor_tags:
+                try:
+                    events = ea.Tensors(tag)
+                    for event in events:
+                        # For text events, copy regardless of step if step <= max_step OR step == 0
+                        # (some metadata like script_version is stored at step 0)
+                        if event.step <= max_step:
+                            try:
+                                # Try to decode as text
+                                if event.tensor_proto.string_val:
+                                    text_value = event.tensor_proto.string_val[0].decode('utf-8')
+                                    target_writer.add_text(tag, text_value, event.step, walltime=event.wall_time)
+                                    total_text_events += 1
+                            except Exception as decode_err:
+                                pass  # Skip if can't decode this specific event
+                except Exception as tag_err:
+                    pass  # Skip if can't load this tag
+            
+            print(f"  → Copied {total_text_events} text events")
+        
+        target_writer.flush()
+        
+        print(f"✅ Successfully copied events up to step {max_step}")
+        print('='*80 + '\n')
+        
+    except Exception as e:
+        print(f"Warning: Failed to copy TensorBoard events: {e}")
+        print("Continuing without copied logs...")
+        print('='*80 + '\n')
+
+
 def compute_weight_similarity(weight_A, weight_B):
     """Compute cosine similarity between two weight matrices."""
     flat_A = weight_A.view(-1)
@@ -189,7 +287,9 @@ def load_live_config(config_path):
 
 
 def create_initial_live_config(config_path, learning_rate, backbone_lr, temperature, 
-                                log_interval, similarity_log_interval, eval_interval):
+                                log_interval, similarity_log_interval, eval_interval,
+                                loss_balance_strength, loss_balance_ema_momentum, 
+                                loss_balance_clip_min, loss_balance_clip_max):
     """Create initial live configuration file."""
     config = {
         "learning_rate": learning_rate,
@@ -197,7 +297,11 @@ def create_initial_live_config(config_path, learning_rate, backbone_lr, temperat
         "temperature": temperature,
         "log_interval": log_interval,
         "similarity_log_interval": similarity_log_interval,
-        "eval_interval": eval_interval
+        "eval_interval": eval_interval,
+        "loss_balance_strength": loss_balance_strength,
+        "loss_balance_ema_momentum": loss_balance_ema_momentum,
+        "loss_balance_clip_min": loss_balance_clip_min,
+        "loss_balance_clip_max": loss_balance_clip_max
     }
     with open(config_path, 'w') as f:
         json.dump(config, indent=2, fp=f)
@@ -234,6 +338,15 @@ def apply_config_changes(current_config, new_config, optimizer, embedding_params
         new_temp = new_config["temperature"]
         current_config["temperature"] = new_temp
         changes["temperature"] = (old_temp, new_temp)
+    
+    # Check and apply loss balance parameter changes
+    for param_name in ["loss_balance_strength", "loss_balance_ema_momentum", 
+                       "loss_balance_clip_min", "loss_balance_clip_max"]:
+        if param_name in new_config and new_config[param_name] != current_config[param_name]:
+            old_val = current_config[param_name]
+            new_val = new_config[param_name]
+            current_config[param_name] = new_val
+            changes[param_name] = (old_val, new_val)
     
     # Check and apply interval changes
     for interval_name in ["log_interval", "similarity_log_interval", "eval_interval"]:
@@ -308,26 +421,29 @@ def train(
     model_name='unsloth/Llama-3.2-1B',
     device=None,
     batch_size=4,
-    learning_rate=1e-4,
-    backbone_lr=1e-5,
-    freeze_backbone=True,
-    num_train_steps=50_000,
+    learning_rate=1e-3,
+    backbone_lr=2e-5,
+    freeze_backbone=False,
+    num_train_steps=200_000,
     max_length=4096,
     log_interval=1,
     similarity_log_interval=50,
     eval_interval=500,
-    save_interval=10_000,
+    save_interval=20_000,
     max_gen_tokens=50,
     temperature=0.7,
     seed=42,
     output_dir='./checkpoints',
     tensorboard_log_dir='./tensorboard_logs',
     # Loss balancing parameters
-    loss_balance_strength=1.0,
+    loss_balance_strength=2.0,
     loss_balance_ema_momentum=0.99,
     loss_balance_warmup_steps=100,
     loss_balance_clip_min=0.1,
-    loss_balance_clip_max=10.0
+    loss_balance_clip_max=10.0,
+    # Resume parameters
+    resume_from_checkpoint=None,
+    continue_run=None
 ):
     """Train Dual-Stream LLM.
     
@@ -354,6 +470,8 @@ def train(
         loss_balance_warmup_steps: Steps before enabling loss balancing
         loss_balance_clip_min: Minimum value for alpha/beta coefficients
         loss_balance_clip_max: Maximum value for alpha/beta coefficients
+        resume_from_checkpoint: Path to checkpoint to resume from, or 'auto' to find latest
+        continue_run: Path to existing run directory to continue (preserves run name and logs)
     
     Live Configuration:
         A live_config.json file is created in the run directory. You can edit this file during training
@@ -364,35 +482,133 @@ def train(
         - log_interval: How often to log metrics
         - similarity_log_interval: How often to log weight similarities
         - eval_interval: How often to run generation samples
+        - loss_balance_strength: Strength of loss balancing
+        - loss_balance_ema_momentum: EMA momentum for loss tracking
+        - loss_balance_clip_min: Minimum value for alpha/beta coefficients
+        - loss_balance_clip_max: Maximum value for alpha/beta coefficients
     """
     # Set seed for reproducibility
     set_seed(seed)
     
-    # Create unique subdirectory for this run with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"run_{timestamp}"
+    # Initialize variables for resume functionality
+    resume_step = 0
+    checkpoint_data = None
     
-    # Create run-specific checkpoint directory
-    output_dir = os.path.join(output_dir, run_name)
-    os.makedirs(output_dir, exist_ok=True)
+    # Handle continue_run and resume logic
+    if continue_run:
+        # When continuing a run, create a NEW run directory and copy logs
+        if not os.path.exists(continue_run):
+            raise ValueError(f"Continue run directory not found: {continue_run}")
+        
+        old_run_name = os.path.basename(continue_run)
+        old_checkpoint_dir = continue_run
+        
+        # Construct old tensorboard directory path
+        # tensorboard_log_dir is the BASE directory (e.g., './tensorboard_logs')
+        old_tensorboard_dir = None
+        if tensorboard_log_dir:
+            old_tensorboard_dir = os.path.join(tensorboard_log_dir, old_run_name)
+        
+        # Load existing live config
+        old_live_config_path = os.path.join(old_checkpoint_dir, 'live_config.json')
+        existing_live_config = load_live_config(old_live_config_path)
+        
+        # Handle resume from checkpoint
+        if resume_from_checkpoint:
+            if resume_from_checkpoint == 'auto':
+                checkpoint_result = find_latest_checkpoint(old_checkpoint_dir)
+                if checkpoint_result:
+                    checkpoint_path, resume_step = checkpoint_result
+                    print(f"Found latest checkpoint: {checkpoint_path} at step {resume_step}")
+                else:
+                    raise ValueError(f"No checkpoints found in {old_checkpoint_dir}")
+            else:
+                checkpoint_path = resume_from_checkpoint
+                if not os.path.exists(checkpoint_path):
+                    raise ValueError(f"Checkpoint not found: {checkpoint_path}")
+                # Extract step from checkpoint path or filename
+                try:
+                    checkpoint_data = torch.load(checkpoint_path, map_location='cpu')
+                    resume_step = checkpoint_data.get('step', 0)
+                except Exception as e:
+                    raise ValueError(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            
+            # Load checkpoint
+            checkpoint_data = torch.load(checkpoint_path, map_location='cpu')
+            resume_step = checkpoint_data.get('step', 0)
+            print(f"Resuming from step {resume_step}")
+        
+        # Create NEW run directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{old_run_name}_resumed_{timestamp}"
+        
+        output_dir = os.path.join(os.path.dirname(old_checkpoint_dir), run_name)
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Created new run directory: {output_dir}")
+        
+        # Create NEW tensorboard directory and copy events
+        if tensorboard_log_dir and old_tensorboard_dir and os.path.exists(old_tensorboard_dir):
+            # Create new tensorboard directory in the BASE tensorboard_log_dir
+            tensorboard_log_dir = os.path.join(tensorboard_log_dir, run_name)
+            os.makedirs(tensorboard_log_dir, exist_ok=True)
+            
+            # Note: We'll create writer later and copy events into it
+            # to ensure everything goes into one event file
+        elif tensorboard_log_dir:
+            tensorboard_log_dir = os.path.join(tensorboard_log_dir, run_name)
+            os.makedirs(tensorboard_log_dir, exist_ok=True)
+        
+        # Copy live config to new run
+        live_config_path = os.path.join(output_dir, 'live_config.json')
+        
+        # Update parameters from existing live config if available
+        if existing_live_config:
+            learning_rate = existing_live_config.get('learning_rate', learning_rate)
+            backbone_lr = existing_live_config.get('backbone_lr', backbone_lr)
+            temperature = existing_live_config.get('temperature', temperature)
+            log_interval = existing_live_config.get('log_interval', log_interval)
+            similarity_log_interval = existing_live_config.get('similarity_log_interval', similarity_log_interval)
+            eval_interval = existing_live_config.get('eval_interval', eval_interval)
+            loss_balance_strength = existing_live_config.get('loss_balance_strength', loss_balance_strength)
+            loss_balance_ema_momentum = existing_live_config.get('loss_balance_ema_momentum', loss_balance_ema_momentum)
+            loss_balance_clip_min = existing_live_config.get('loss_balance_clip_min', loss_balance_clip_min)
+            loss_balance_clip_max = existing_live_config.get('loss_balance_clip_max', loss_balance_clip_max)
+            
+    else:
+        # Create new run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"run_{timestamp}"
+        
+        # Create run-specific checkpoint directory
+        output_dir = os.path.join(output_dir, run_name)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create run-specific tensorboard directory
+        if tensorboard_log_dir:
+            tensorboard_log_dir = os.path.join(tensorboard_log_dir, run_name)
+            os.makedirs(tensorboard_log_dir, exist_ok=True)
+        
+        # Create initial live config
+        live_config_path = os.path.join(output_dir, 'live_config.json')
     
-    # Create run-specific tensorboard directory
-    if tensorboard_log_dir:
-        tensorboard_log_dir = os.path.join(tensorboard_log_dir, run_name)
-        os.makedirs(tensorboard_log_dir, exist_ok=True)
-    
-    # Create live config file for runtime parameter adjustments
-    live_config_path = os.path.join(output_dir, 'live_config.json')
+    # Ensure live config exists with all parameters
     live_config = {
         "learning_rate": learning_rate,
         "backbone_lr": backbone_lr,
         "temperature": temperature,
         "log_interval": log_interval,
         "similarity_log_interval": similarity_log_interval,
-        "eval_interval": eval_interval
+        "eval_interval": eval_interval,
+        "loss_balance_strength": loss_balance_strength,
+        "loss_balance_ema_momentum": loss_balance_ema_momentum,
+        "loss_balance_clip_min": loss_balance_clip_min,
+        "loss_balance_clip_max": loss_balance_clip_max
     }
+    
     create_initial_live_config(live_config_path, learning_rate, backbone_lr, temperature,
-                               log_interval, similarity_log_interval, eval_interval)
+                               log_interval, similarity_log_interval, eval_interval,
+                               loss_balance_strength, loss_balance_ema_momentum, 
+                               loss_balance_clip_min, loss_balance_clip_max)
     live_config_check_interval = 10  # Check for config changes every N steps
     
     rank, world_size, local_rank = setup_distributed(device)
@@ -416,8 +632,16 @@ def train(
         print(f"Live config path: {live_config_path}")
         
         if tensorboard_log_dir:
+            # Create writer
             writer = SummaryWriter(log_dir=tensorboard_log_dir)
-            print(f"Tensorboard logging enabled: {tensorboard_log_dir}")
+            if resume_step > 0:
+                print(f"Tensorboard logging enabled: {tensorboard_log_dir} (resuming from step {resume_step})")
+            else:
+                print(f"Tensorboard logging enabled: {tensorboard_log_dir}")
+            
+            # Copy old TensorBoard events into the same writer (if resuming from continue_run)
+            if continue_run and old_tensorboard_dir and os.path.exists(old_tensorboard_dir) and resume_step > 0:
+                copy_tensorboard_events_to_new_run(old_tensorboard_dir, writer, resume_step, rank=0)
             
             # Save script version to tensorboard
             script_path = __file__
@@ -526,11 +750,27 @@ def train(
     
     loss_fn = nn.CrossEntropyLoss()
     
+    # Restore model and optimizer states from checkpoint if resuming
+    if checkpoint_data:
+        print("Loading model state dict...")
+        model.load_state_dict(checkpoint_data['model_state_dict'])
+        print("Loading optimizer state dict...")  
+        optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+        print("Model and optimizer states restored successfully")
+    
     # Initialize loss balancing variables
     ema_loss_A = None
     ema_loss_B = None
     alpha = 1.0
     beta = 1.0
+    
+    # Restore loss balancing variables from checkpoint if resuming
+    if checkpoint_data:
+        ema_loss_A = checkpoint_data.get('ema_loss_A', ema_loss_A)
+        ema_loss_B = checkpoint_data.get('ema_loss_B', ema_loss_B)
+        alpha = checkpoint_data.get('alpha', alpha)
+        beta = checkpoint_data.get('beta', beta)
+        print(f"Restored loss balancing state: ema_A={ema_loss_A:.4f}, ema_B={ema_loss_B:.4f}, alpha={alpha:.4f}, beta={beta:.4f}")
     
     if rank == 0:
         print(f"\nLoss balancing configuration:")
@@ -578,15 +818,21 @@ def train(
             writer.add_scalar('hyperparams/learning_rate', live_config['learning_rate'], 0)
             writer.add_scalar('hyperparams/backbone_lr', live_config['backbone_lr'], 0)
             writer.add_scalar('hyperparams/temperature', live_config['temperature'], 0)
+            writer.add_scalar('hyperparams/loss_balance_strength', live_config['loss_balance_strength'], 0)
+            writer.add_scalar('hyperparams/loss_balance_ema_momentum', live_config['loss_balance_ema_momentum'], 0)
+            writer.add_scalar('hyperparams/loss_balance_clip_min', live_config['loss_balance_clip_min'], 0)
+            writer.add_scalar('hyperparams/loss_balance_clip_max', live_config['loss_balance_clip_max'], 0)
             
             # Log initial loss balancing coefficients
             writer.add_scalar('loss_balance/alpha', alpha, 0)
             writer.add_scalar('loss_balance/beta', beta, 0)
             writer.add_scalar('loss_balance/alpha_beta_ratio', alpha / beta if beta > 0 else 0, 0)
+            if ema_loss_A is not None and ema_loss_B is not None:
+                writer.add_scalar('loss_balance/losses_ratio', ema_loss_A / ema_loss_B if ema_loss_B > 0 else 0, 0)
             
             writer.flush()
     
-    for step in range(num_train_steps):
+    for step in range(resume_step, num_train_steps):
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -607,20 +853,25 @@ def train(
         loss_A = loss_fn(logits_A.view(-1, logits_A.size(-1)), labels_A.view(-1))
         loss_B = loss_fn(logits_B.view(-1, logits_B.size(-1)), labels_B.view(-1))
         
-        # Update EMA for loss balancing
+        # Update EMA for loss balancing (use live config values)
+        current_ema_momentum = live_config.get('loss_balance_ema_momentum', loss_balance_ema_momentum)
         if ema_loss_A is None:
             ema_loss_A = loss_A.item()
             ema_loss_B = loss_B.item()
         else:
-            ema_loss_A = loss_balance_ema_momentum * ema_loss_A + (1 - loss_balance_ema_momentum) * loss_A.item()
-            ema_loss_B = loss_balance_ema_momentum * ema_loss_B + (1 - loss_balance_ema_momentum) * loss_B.item()
+            ema_loss_A = current_ema_momentum * ema_loss_A + (1 - current_ema_momentum) * loss_A.item()
+            ema_loss_B = current_ema_momentum * ema_loss_B + (1 - current_ema_momentum) * loss_B.item()
         
-        # Compute loss balancing coefficients after warmup
+        # Compute loss balancing coefficients after warmup (use live config values)
         if step >= loss_balance_warmup_steps:
+            current_strength = live_config.get('loss_balance_strength', loss_balance_strength)
+            current_clip_min = live_config.get('loss_balance_clip_min', loss_balance_clip_min)
+            current_clip_max = live_config.get('loss_balance_clip_max', loss_balance_clip_max)
+            
             # Compute weights based on EMA losses
             total_loss = ema_loss_A + ema_loss_B
-            weight_A = (ema_loss_A / total_loss) ** loss_balance_strength
-            weight_B = (ema_loss_B / total_loss) ** loss_balance_strength
+            weight_A = (ema_loss_A / total_loss) ** current_strength
+            weight_B = (ema_loss_B / total_loss) ** current_strength
             
             # Normalize so alpha + beta = 2
             norm = weight_A + weight_B
@@ -628,8 +879,8 @@ def train(
             beta = weight_B / norm * 2.0
             
             # Apply clipping
-            alpha = torch.clamp(torch.tensor(alpha), loss_balance_clip_min, loss_balance_clip_max).item()
-            beta = torch.clamp(torch.tensor(beta), loss_balance_clip_min, loss_balance_clip_max).item()
+            alpha = torch.clamp(torch.tensor(alpha), current_clip_min, current_clip_max).item()
+            beta = torch.clamp(torch.tensor(beta), current_clip_min, current_clip_max).item()
         else:
             alpha = 1.0
             beta = 1.0
@@ -667,6 +918,14 @@ def train(
                             writer.add_scalar('hyperparams/backbone_lr', changes['backbone_lr'][1], step + 1)
                         if 'temperature' in changes:
                             writer.add_scalar('hyperparams/temperature', changes['temperature'][1], step + 1)
+                        if 'loss_balance_strength' in changes:
+                            writer.add_scalar('hyperparams/loss_balance_strength', changes['loss_balance_strength'][1], step + 1)
+                        if 'loss_balance_ema_momentum' in changes:
+                            writer.add_scalar('hyperparams/loss_balance_ema_momentum', changes['loss_balance_ema_momentum'][1], step + 1)
+                        if 'loss_balance_clip_min' in changes:
+                            writer.add_scalar('hyperparams/loss_balance_clip_min', changes['loss_balance_clip_min'][1], step + 1)
+                        if 'loss_balance_clip_max' in changes:
+                            writer.add_scalar('hyperparams/loss_balance_clip_max', changes['loss_balance_clip_max'][1], step + 1)
                         
                         writer.flush()
                 
@@ -692,6 +951,7 @@ def train(
                 writer.add_scalar('loss_balance/alpha', alpha, step + 1)
                 writer.add_scalar('loss_balance/beta', beta, step + 1)
                 writer.add_scalar('loss_balance/alpha_beta_ratio', alpha / beta if beta > 0 else 0, step + 1)
+                writer.add_scalar('loss_balance/losses_ratio', ema_loss_A / ema_loss_B if ema_loss_B > 0 else 0, step + 1)
                 writer.flush()
         
         if rank == 0 and (step + 1) % similarity_log_interval == 0:
