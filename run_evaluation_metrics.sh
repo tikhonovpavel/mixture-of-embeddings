@@ -1,0 +1,1 @@
+python evaluate_model.py  --model_name='unsloth/Llama-3.2-1B'  --checkpoint_path='/disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20251021_170250/checkpoint-160000/model.pt'  --output_file='/disk/4tb/tikhonov/projects/mixture-of-embeddings/metrics_evaluation_results/run_20251021_170250_checkpoint-160000.jsonl'  --num_samples=1000
