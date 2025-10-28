@@ -83,7 +83,7 @@ class DualStreamLLM(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
         
-    def forward(self, input_ids_A, attention_mask_A, input_ids_B, attention_mask_B):
+    def forward(self, input_ids_A, attention_mask_A, input_ids_B, attention_mask_B, lambdas=None):
         # Get embeddings
         if self.shared_embeddings:
             # Use same embedding matrix for both streams
@@ -94,10 +94,19 @@ class DualStreamLLM(nn.Module):
             embeds_A = self.emb_A(input_ids_A)
             embeds_B = self.emb_B(input_ids_B)
         
-        # Fuse embeddings: average of both streams
-        fused_embeds = (embeds_A + embeds_B) * 0.5
+        # Fuse embeddings based on objective
+        if self.objective == 'mixup' and lambdas is not None:
+            # Mixup: weighted combination based on lambda
+            # lambdas shape: [batch_size], need to broadcast to [batch_size, seq_len, hidden_dim]
+            lambdas_expanded = lambdas.view(-1, 1, 1).to(embeds_A.dtype).to(embeds_A.device)
+            fused_embeds = lambdas_expanded * embeds_A + (1 - lambdas_expanded) * embeds_B
+        else:
+            # Average fusion for other objectives
+            fused_embeds = (embeds_A + embeds_B) * 0.5
         
-        attention_mask = attention_mask_A * attention_mask_B
+        # Use OR operation for attention mask: attend if EITHER stream has valid token
+        # This prevents empty attention masks when sequences have different lengths
+        attention_mask = torch.maximum(attention_mask_A, attention_mask_B)
         
         transformer_outputs = self.backbone.model(
             inputs_embeds=fused_embeds,
@@ -112,7 +121,7 @@ class DualStreamLLM(nn.Module):
             logits_A = self.unemb_A(last_hidden_state)
             logits_B = self.unemb_B(last_hidden_state)
             return logits_A, logits_B
-        elif self.objective == 'averaged':
+        elif self.objective == 'averaged' or self.objective == 'mixup':
             logits = self.unemb(last_hidden_state)
             return logits
         else:

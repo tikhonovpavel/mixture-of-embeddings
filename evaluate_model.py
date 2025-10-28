@@ -7,6 +7,7 @@ from datasets import load_dataset
 import fire
 import json
 import os
+import copy
 from tqdm import tqdm
 import evaluate as hf_evaluate  # Using Hugging Face's evaluate library
 
@@ -86,6 +87,66 @@ def generate_from_dual_stream_separate(model, tokenizer, prompt_A, prompt_B, dev
     )
 
 
+def generate_from_dual_stream_averaged_or_mixup(model, tokenizer, prompt_A, prompt_B, device, max_new_tokens=50, temperature=0.7, objective='averaged'):
+    """Generates text from averaged/mixup models using pure inputs (no mixing during inference)."""
+    model.eval()
+
+    input_ids_A = tokenizer(prompt_A, return_tensors='pt').input_ids.to(device)
+    input_ids_B = tokenizer(prompt_B, return_tensors='pt').input_ids.to(device)
+    
+    pad_token_id = tokenizer.pad_token_id
+    eos_token_id = tokenizer.eos_token_id
+    
+    with torch.no_grad():
+        # Generate for stream A (pure A: lambda=1)
+        gen_input_A = input_ids_A.clone()
+        attention_mask_A = torch.ones_like(gen_input_A)
+        
+        for _ in range(max_new_tokens):
+            # For pure A generation, pass same input for both streams
+            lambdas = torch.ones(1, device=device) if objective == 'mixup' else None
+            logits = model(gen_input_A, attention_mask_A, gen_input_A, attention_mask_A, lambdas=lambdas)
+            
+            logits_last = logits[:, -1, :]
+            if temperature > 0:
+                probs = F.softmax(logits_last / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits_last, dim=-1, keepdim=True)
+            
+            gen_input_A = torch.cat([gen_input_A, next_token], dim=1)
+            attention_mask_A = torch.cat([attention_mask_A, torch.ones((1, 1), device=device)], dim=1)
+            
+            if next_token.item() == eos_token_id:
+                break
+        
+        # Generate for stream B (pure B: lambda=0)
+        gen_input_B = input_ids_B.clone()
+        attention_mask_B = torch.ones_like(gen_input_B)
+        
+        for _ in range(max_new_tokens):
+            lambdas = torch.zeros(1, device=device) if objective == 'mixup' else None
+            logits = model(gen_input_B, attention_mask_B, gen_input_B, attention_mask_B, lambdas=lambdas)
+            
+            logits_last = logits[:, -1, :]
+            if temperature > 0:
+                probs = F.softmax(logits_last / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits_last, dim=-1, keepdim=True)
+            
+            gen_input_B = torch.cat([gen_input_B, next_token], dim=1)
+            attention_mask_B = torch.cat([attention_mask_B, torch.ones((1, 1), device=device)], dim=1)
+            
+            if next_token.item() == eos_token_id:
+                break
+    
+    return (
+        tokenizer.decode(gen_input_A[0], skip_special_tokens=True),
+        tokenizer.decode(gen_input_B[0], skip_special_tokens=True)
+    )
+
+
 def generate_from_original(model, tokenizer, prompt, device, max_new_tokens=50, temperature=0.7):
     """Generate text from the original Hugging Face model."""
     model.eval()
@@ -124,10 +185,34 @@ def calculate_original_model_loss(model, tokenizer, text, device, max_length=512
     return loss.item()
 
 
+def print_running_stats(total_metrics, total_loss, processed_pairs):
+    """Prints a formatted summary of running evaluation statistics."""
+    if processed_pairs == 0:
+        return
+
+    print(f"\n--- Running Stats after {processed_pairs} pairs ---")
+
+    for model_type in ['dual_A', 'dual_B', 'orig_A', 'orig_B', 'hybrid_A', 'hybrid_B']:
+        if model_type not in total_metrics: continue
+        print(f"\n--- Averages for {model_type} ---")
+        avg_metrics = {k: v / processed_pairs for k, v in total_metrics[model_type].items()}
+
+        print(f"  ROUGE-1: {avg_metrics.get('rouge1', 0):.4f}, ROUGE-2: {avg_metrics.get('rouge2', 0):.4f}, ROUGE-L: {avg_metrics.get('rougeL', 0):.4f}")
+        print(f"  BLEU: {avg_metrics.get('bleu', 0):.4f}")
+        print(f"  BERTScore F1: {avg_metrics.get('bert_score_f1', 0):.4f}")
+
+    avg_loss_A = total_loss['A'] / processed_pairs
+    avg_loss_B = total_loss['B'] / processed_pairs
+    print("\n--- Original Model Average Loss ---")
+    print(f"  Stream A: {avg_loss_A:.4f}")
+    print(f"  Stream B: {avg_loss_B:.4f}")
+    print("---------------------------------------\n")
+
+
 def evaluate(
     model_name: str,
     checkpoint_path: str,
-    output_file: str,
+    output_file: str = None,
     dataset_name: str = 'allenai/c4',
     dataset_config: str = 'en',
     dataset_split: str = 'validation',
@@ -137,6 +222,8 @@ def evaluate(
     max_length: int = 512,
     temperature: float = 0.7,
     device: str = 'cuda:0',
+    objective: str = 'separate',  # 'separate', 'averaged', or 'mixup'
+    shared_embeddings: bool = False,
 ):
     """
     Evaluate a trained dual-stream model and compare it with the original backbone model.
@@ -156,7 +243,16 @@ def evaluate(
         device (str): The device to run the models on (e.g., 'cuda:0').
     """
     print("Starting evaluation...")
+
+    # if output_file is None:
+    #     checkpoint_name = os.path.basename(checkpoint_path)
+
+    #     # if checkpoint_name == checkpoints/run_20251027_235405/checkpoint-40000/model.pt
+    #     # then output_file 'metrics_evaluation_results/run_20251027_235405_checkpoint-40000.jsonl'
+    #     output_file = f'metrics_evaluation_results'
     
+    print(f'Saving to {output_file}')
+
     # Setup device
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -185,13 +281,21 @@ def evaluate(
         model_name=model_name,
         vocab_size=vocab_size,
         hidden_dim=hidden_dim,
-        freeze_backbone=True # This doesn't matter for evaluation
+        freeze_backbone=True,  # This doesn't matter for evaluation
+        objective=objective,
+        shared_embeddings=shared_embeddings
     )
     
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     dual_stream_model.load_state_dict(checkpoint['model_state_dict'])
     dual_stream_model = dual_stream_model.to(device)
     dual_stream_model.eval()
+    
+    # Create a hybrid model with trained embeddings and original backbone
+    print("Creating hybrid model (trained embeddings + original backbone)...")
+    hybrid_model = copy.deepcopy(dual_stream_model)
+    hybrid_model.backbone = original_model # original_model is already on device
+    hybrid_model.eval()
     
     # Load metrics
     print("Loading evaluation metrics: ROUGE, BLEU, BERT-Score")
@@ -207,6 +311,28 @@ def evaluate(
     if os.path.dirname(output_file):
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
+    # --- Initialize containers for running statistics ---
+    total_metrics = {
+        'dual_A': {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0, 'rougeLsum': 0.0, 'bleu': 0.0, 'bert_score_f1': 0.0},
+        'dual_B': {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0, 'rougeLsum': 0.0, 'bleu': 0.0, 'bert_score_f1': 0.0},
+        'orig_A': {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0, 'rougeLsum': 0.0, 'bleu': 0.0, 'bert_score_f1': 0.0},
+        'orig_B': {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0, 'rougeLsum': 0.0, 'bleu': 0.0, 'bert_score_f1': 0.0},
+        'hybrid_A': {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0, 'rougeLsum': 0.0, 'bleu': 0.0, 'bert_score_f1': 0.0},
+        'hybrid_B': {'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0, 'rougeLsum': 0.0, 'bleu': 0.0, 'bert_score_f1': 0.0},
+    }
+    total_loss = {'A': 0.0, 'B': 0.0}
+    processed_pairs = 0
+
+    def update_metrics_summary(total_metrics_dict, new_metrics_dict):
+        """Helper to accumulate metrics."""
+        for rouge_key, value in new_metrics_dict['rouge'].items():
+            if rouge_key in total_metrics_dict:
+                total_metrics_dict[rouge_key] += value
+        if 'bleu' in new_metrics_dict and 'bleu' in new_metrics_dict['bleu']:
+            total_metrics_dict['bleu'] += new_metrics_dict['bleu']['bleu']
+        if 'bert_score_f1' in new_metrics_dict:
+            total_metrics_dict['bert_score_f1'] += new_metrics_dict['bert_score_f1']
+
     print(f"Starting evaluation loop for {num_samples} samples...")
     data_iterator = iter(dataset)
     with open(output_file, 'w') as f:
@@ -233,8 +359,13 @@ def evaluate(
             prompt_B = tokenizer.decode(tokenized_B[:prompt_tokens], skip_special_tokens=True)
             reference_B = tokenizer.decode(tokenized_B[prompt_tokens:], skip_special_tokens=True)
 
-            # Generate from both models
-            generated_dual_A, generated_dual_B = generate_from_dual_stream_separate(dual_stream_model, tokenizer, prompt_A, prompt_B, device, max_gen_tokens, temperature)
+            # Generate from both models based on objective
+            if objective == 'separate':
+                generated_dual_A, generated_dual_B = generate_from_dual_stream_separate(dual_stream_model, tokenizer, prompt_A, prompt_B, device, max_gen_tokens, temperature)
+                generated_hybrid_A, generated_hybrid_B = generate_from_dual_stream_separate(hybrid_model, tokenizer, prompt_A, prompt_B, device, max_gen_tokens, temperature)
+            else:  # averaged or mixup
+                generated_dual_A, generated_dual_B = generate_from_dual_stream_averaged_or_mixup(dual_stream_model, tokenizer, prompt_A, prompt_B, device, max_gen_tokens, temperature, objective=objective)
+                generated_hybrid_A, generated_hybrid_B = generate_from_dual_stream_averaged_or_mixup(hybrid_model, tokenizer, prompt_A, prompt_B, device, max_gen_tokens, temperature, objective=objective)
             
             # For a fair comparison, generate from the original model on both prompts
             generated_orig_A = generate_from_original(original_model, tokenizer, prompt_A, device, max_gen_tokens, temperature)
@@ -245,6 +376,8 @@ def evaluate(
             if generated_dual_B.startswith(prompt_B): generated_dual_B = generated_dual_B[len(prompt_B):].strip()
             if generated_orig_A.startswith(prompt_A): generated_orig_A = generated_orig_A[len(prompt_A):].strip()
             if generated_orig_B.startswith(prompt_B): generated_orig_B = generated_orig_B[len(prompt_B):].strip()
+            if generated_hybrid_A.startswith(prompt_A): generated_hybrid_A = generated_hybrid_A[len(prompt_A):].strip()
+            if generated_hybrid_B.startswith(prompt_B): generated_hybrid_B = generated_hybrid_B[len(prompt_B):].strip()
                 
             # --- Calculate metrics ---
             # Compare A stream against reference A
@@ -263,6 +396,15 @@ def evaluate(
             bleu_orig_B = bleu.compute(predictions=[generated_orig_B], references=[[reference_B]]) if generated_orig_B else {'bleu': 0.0}
             bertscore_orig_B = bertscore.compute(predictions=[generated_orig_B], references=[reference_B], lang='en', device=device)
 
+            # Compare hybrid stream against references
+            rouge_hybrid_A = rouge.compute(predictions=[generated_hybrid_A], references=[reference_A])
+            bleu_hybrid_A = bleu.compute(predictions=[generated_hybrid_A], references=[[reference_A]]) if generated_hybrid_A else {'bleu': 0.0}
+            bertscore_hybrid_A = bertscore.compute(predictions=[generated_hybrid_A], references=[reference_A], lang='en', device=device)
+            
+            rouge_hybrid_B = rouge.compute(predictions=[generated_hybrid_B], references=[reference_B])
+            bleu_hybrid_B = bleu.compute(predictions=[generated_hybrid_B], references=[[reference_B]]) if generated_hybrid_B else {'bleu': 0.0}
+            bertscore_hybrid_B = bertscore.compute(predictions=[generated_hybrid_B], references=[reference_B], lang='en', device=device)
+
             # Calculate baseline loss for original model on the full text
             loss_A = calculate_original_model_loss(original_model, tokenizer, text_A, device, max_length)
             loss_B = calculate_original_model_loss(original_model, tokenizer, text_B, device, max_length)
@@ -278,6 +420,8 @@ def evaluate(
                 'generated_dual_stream_B': generated_dual_B,
                 'generated_original_A': generated_orig_A,
                 'generated_original_B': generated_orig_B,
+                'generated_hybrid_A': generated_hybrid_A,
+                'generated_hybrid_B': generated_hybrid_B,
                 'metrics_dual_stream_A': {
                     'rouge': rouge_dual_A, 'bleu': bleu_dual_A,
                     'bert_score_f1': bertscore_dual_A['f1'][0],
@@ -294,6 +438,14 @@ def evaluate(
                      'rouge': rouge_orig_B, 'bleu': bleu_orig_B,
                     'bert_score_f1': bertscore_orig_B['f1'][0],
                 },
+                'metrics_hybrid_A': {
+                    'rouge': rouge_hybrid_A, 'bleu': bleu_hybrid_A,
+                    'bert_score_f1': bertscore_hybrid_A['f1'][0],
+                },
+                'metrics_hybrid_B': {
+                    'rouge': rouge_hybrid_B, 'bleu': bleu_hybrid_B,
+                    'bert_score_f1': bertscore_hybrid_B['f1'][0],
+                },
                 'original_model_loss_A': loss_A,
                 'original_model_loss_B': loss_B
             }
@@ -301,6 +453,25 @@ def evaluate(
             f.write(json.dumps(result) + '\n')
             f.flush()
 
+            # --- Update and Print Running Statistics ---
+            processed_pairs += 1
+            
+            update_metrics_summary(total_metrics['dual_A'], result['metrics_dual_stream_A'])
+            update_metrics_summary(total_metrics['dual_B'], result['metrics_dual_stream_B'])
+            update_metrics_summary(total_metrics['orig_A'], result['metrics_original_A'])
+            update_metrics_summary(total_metrics['orig_B'], result['metrics_original_B'])
+            update_metrics_summary(total_metrics['hybrid_A'], result['metrics_hybrid_A'])
+            update_metrics_summary(total_metrics['hybrid_B'], result['metrics_hybrid_B'])
+
+            total_loss['A'] += result['original_model_loss_A']
+            total_loss['B'] += result['original_model_loss_B']
+
+            if (i + 1) % 10 == 0 and (i + 1) < num_samples:
+                print_running_stats(total_metrics, total_loss, processed_pairs)
+
+
+    print("\n--- Final Evaluation Summary ---")
+    print_running_stats(total_metrics, total_loss, processed_pairs)
     print(f"\nEvaluation finished. Results saved to {output_file}")
 
 

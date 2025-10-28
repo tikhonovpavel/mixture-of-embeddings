@@ -35,10 +35,11 @@ def set_seed(seed):
 
 
 class DualStreamCollator:
-    def __init__(self, tokenizer, max_length=512, objective='separate'):
+    def __init__(self, tokenizer, max_length=512, objective='separate', mixup_alpha=1.0):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.objective = objective
+        self.mixup_alpha = mixup_alpha
         
     def __call__(self, batch):
         texts_A = [item['text'] for item in batch[::2]]
@@ -102,6 +103,28 @@ class DualStreamCollator:
                 'input_ids_B': encoded_B['input_ids'],
                 'attention_mask_B': encoded_B['attention_mask'],
                 'next_tokens_B': next_tokens_B,
+                'pad_token_id': self.tokenizer.pad_token_id,
+            }
+        elif self.objective == 'mixup':
+            # Sample mixing coefficients from Beta distribution for each sample in batch
+            batch_size = encoded_A['input_ids'].size(0)
+            # Sample λ ~ Beta(α, α) for each sample
+            lambdas = torch.from_numpy(
+                np.random.beta(self.mixup_alpha, self.mixup_alpha, size=batch_size)
+            ).float()
+            
+            # Get next token ids for creating soft targets
+            next_tokens_A = encoded_A['input_ids'][:, 1:].clone()
+            next_tokens_B = encoded_B['input_ids'][:, 1:].clone()
+            
+            return {
+                'input_ids_A': encoded_A['input_ids'],
+                'attention_mask_A': encoded_A['attention_mask'],
+                'next_tokens_A': next_tokens_A,
+                'input_ids_B': encoded_B['input_ids'],
+                'attention_mask_B': encoded_B['attention_mask'],
+                'next_tokens_B': next_tokens_B,
+                'lambdas': lambdas,  # [batch_size]
                 'pad_token_id': self.tokenizer.pad_token_id,
             }
         else:
@@ -331,7 +354,7 @@ def apply_config_changes(current_config, new_config, optimizer, embedding_params
     return changes
 
 
-def generate_samples(model, tokenizer, prompts, device, max_new_tokens=50, temperature=0.7):
+def generate_samples(model, tokenizer, prompts, device, max_new_tokens=50, temperature=0.7, objective='separate'):
     model.eval()
     results = []
     
@@ -345,38 +368,76 @@ def generate_samples(model, tokenizer, prompts, device, max_new_tokens=50, tempe
             input_ids_B = inputs_B['input_ids']
             attention_mask_B = inputs_B['attention_mask']
             
-            max_len = max(input_ids_A.size(1), input_ids_B.size(1))
-            if input_ids_A.size(1) < max_len:
-                pad_len = max_len - input_ids_A.size(1)
-                input_ids_A = torch.cat([input_ids_A, torch.full((1, pad_len), tokenizer.pad_token_id, device=device)], dim=1)
-                attention_mask_A = torch.cat([attention_mask_A, torch.zeros((1, pad_len), device=device)], dim=1)
-            if input_ids_B.size(1) < max_len:
-                pad_len = max_len - input_ids_B.size(1)
-                input_ids_B = torch.cat([input_ids_B, torch.full((1, pad_len), tokenizer.pad_token_id, device=device)], dim=1)
-                attention_mask_B = torch.cat([attention_mask_B, torch.zeros((1, pad_len), device=device)], dim=1)
+            if objective == 'separate':
+                # For separate objective, generate from both streams simultaneously
+                max_len = max(input_ids_A.size(1), input_ids_B.size(1))
+                if input_ids_A.size(1) < max_len:
+                    pad_len = max_len - input_ids_A.size(1)
+                    input_ids_A = torch.cat([input_ids_A, torch.full((1, pad_len), tokenizer.pad_token_id, device=device)], dim=1)
+                    attention_mask_A = torch.cat([attention_mask_A, torch.zeros((1, pad_len), device=device)], dim=1)
+                if input_ids_B.size(1) < max_len:
+                    pad_len = max_len - input_ids_B.size(1)
+                    input_ids_B = torch.cat([input_ids_B, torch.full((1, pad_len), tokenizer.pad_token_id, device=device)], dim=1)
+                    attention_mask_B = torch.cat([attention_mask_B, torch.zeros((1, pad_len), device=device)], dim=1)
+                
+                for _ in range(max_new_tokens):
+                    logits_A, logits_B = model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
+                    
+                    logits_A_scaled = logits_A[:, -1, :] / temperature
+                    logits_B_scaled = logits_B[:, -1, :] / temperature
+                    
+                    probs_A = F.softmax(logits_A_scaled, dim=-1)
+                    probs_B = F.softmax(logits_B_scaled, dim=-1)
+                    
+                    next_token_A = torch.multinomial(probs_A, num_samples=1)
+                    next_token_B = torch.multinomial(probs_B, num_samples=1)
+                    
+                    input_ids_A = torch.cat([input_ids_A, next_token_A], dim=1)
+                    input_ids_B = torch.cat([input_ids_B, next_token_B], dim=1)
+                    attention_mask_A = torch.cat([attention_mask_A, torch.ones((1, 1), device=device)], dim=1)
+                    attention_mask_B = torch.cat([attention_mask_B, torch.ones((1, 1), device=device)], dim=1)
+                    
+                    if next_token_A.item() == tokenizer.eos_token_id and next_token_B.item() == tokenizer.eos_token_id:
+                        break
+                
+                generated_A = tokenizer.decode(input_ids_A[0], skip_special_tokens=True)
+                generated_B = tokenizer.decode(input_ids_B[0], skip_special_tokens=True)
             
-            for _ in range(max_new_tokens):
-                logits_A, logits_B = model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
+            elif objective in ['averaged', 'mixup']:
+                # For averaged/mixup objective, generate from each stream independently using pure inputs
+                # Stream A: use lambda=1 (pure A)
+                for _ in range(max_new_tokens):
+                    # For pure A generation, pass same input for both streams (or use lambda=1)
+                    lambdas = torch.ones(1, device=device) if objective == 'mixup' else None
+                    logits = model(input_ids_A, attention_mask_A, input_ids_A, attention_mask_A, lambdas=lambdas)
+                    
+                    logits_scaled = logits[:, -1, :] / temperature
+                    probs = F.softmax(logits_scaled, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    
+                    input_ids_A = torch.cat([input_ids_A, next_token], dim=1)
+                    attention_mask_A = torch.cat([attention_mask_A, torch.ones((1, 1), device=device)], dim=1)
+                    
+                    if next_token.item() == tokenizer.eos_token_id:
+                        break
                 
-                logits_A_scaled = logits_A[:, -1, :] / temperature
-                logits_B_scaled = logits_B[:, -1, :] / temperature
+                # Stream B: use lambda=0 (pure B) 
+                for _ in range(max_new_tokens):
+                    lambdas = torch.zeros(1, device=device) if objective == 'mixup' else None
+                    logits = model(input_ids_B, attention_mask_B, input_ids_B, attention_mask_B, lambdas=lambdas)
+                    
+                    logits_scaled = logits[:, -1, :] / temperature
+                    probs = F.softmax(logits_scaled, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    
+                    input_ids_B = torch.cat([input_ids_B, next_token], dim=1)
+                    attention_mask_B = torch.cat([attention_mask_B, torch.ones((1, 1), device=device)], dim=1)
+                    
+                    if next_token.item() == tokenizer.eos_token_id:
+                        break
                 
-                probs_A = F.softmax(logits_A_scaled, dim=-1)
-                probs_B = F.softmax(logits_B_scaled, dim=-1)
-                
-                next_token_A = torch.multinomial(probs_A, num_samples=1)
-                next_token_B = torch.multinomial(probs_B, num_samples=1)
-                
-                input_ids_A = torch.cat([input_ids_A, next_token_A], dim=1)
-                input_ids_B = torch.cat([input_ids_B, next_token_B], dim=1)
-                attention_mask_A = torch.cat([attention_mask_A, torch.ones((1, 1), device=device)], dim=1)
-                attention_mask_B = torch.cat([attention_mask_B, torch.ones((1, 1), device=device)], dim=1)
-                
-                if next_token_A.item() == tokenizer.eos_token_id and next_token_B.item() == tokenizer.eos_token_id:
-                    break
-            
-            generated_A = tokenizer.decode(input_ids_A[0], skip_special_tokens=True)
-            generated_B = tokenizer.decode(input_ids_B[0], skip_special_tokens=True)
+                generated_A = tokenizer.decode(input_ids_A[0], skip_special_tokens=True)
+                generated_B = tokenizer.decode(input_ids_B[0], skip_special_tokens=True)
             
             results.append({
                 'prompt_A': prompt_A,
@@ -411,13 +472,15 @@ def train(
     output_dir='./checkpoints',
     tensorboard_log_dir='./tensorboard_logs',
     # Training objective
-    objective='separate',  # 'separate' or 'averaged'
+    objective='separate',  # 'separate', 'averaged', or 'mixup'
     use_loss_balancing=True,
     shared_embeddings=False,  # Use single shared embedding matrix instead of separate emb_A and emb_B
     # Embedding initialization
     embedding_init_strategy='noisy_copy', # 'random', 'copy', or 'noisy_copy'
     unembedding_init_strategy=None, # 'random', 'copy', or 'noisy_copy'. If None, uses same as embedding_init_strategy
     embedding_init_noise_std=0.01,
+    # Mixup parameters
+    mixup_alpha=1.0,  # Alpha parameter for Beta distribution in mixup: λ ~ Beta(α, α)
     # Loss balancing parameters
     loss_balance_strength=5.0,
     loss_balance_ema_momentum=0.99,
@@ -455,12 +518,13 @@ def train(
         seed: Random seed for reproducibility
         output_dir: Output directory for checkpoints
         tensorboard_log_dir: Tensorboard log directory. Set to empty string to disable tensorboard logging.
-        objective: Training objective. 'separate' = two separate targets, 'averaged' = averaged target distribution
-        use_loss_balancing: Whether to use alpha/beta loss balancing coefficients
-        shared_embeddings: If True, use single shared embedding matrix for both streams. If False, use separate emb_A and emb_B.
+        objective: Training objective. 'separate' = two separate targets, 'averaged' = averaged target distribution, 'mixup' = mixup with Beta distribution
+        use_loss_balancing: Whether to use alpha/beta loss balancing coefficients (only for 'separate' objective)
+        shared_embeddings: If True, use single shared embedding matrix for both streams. If False, use separate emb_A and emb_B. (Mixup always uses shared embeddings)
         embedding_init_strategy: How to initialize embeddings. 'random' for normal dist, 'copy' to copy from backbone, 'noisy_copy' to copy from backbone with noise.
         unembedding_init_strategy: How to initialize unembeddings. If None, uses the same strategy as embeddings.
         embedding_init_noise_std: Standard deviation of noise for 'noisy_copy' strategy.
+        mixup_alpha: Alpha parameter for Beta distribution in mixup objective: λ ~ Beta(α, α). Default 1.0 gives uniform distribution.
         loss_balance_strength: Strength of loss balancing (higher = more aggressive)
         loss_balance_ema_momentum: EMA momentum for loss tracking (0.99 = smooth, 0.9 = responsive)
         loss_balance_warmup_steps: Steps before enabling loss balancing
@@ -617,6 +681,12 @@ def train(
     else:
         device = torch.device(f'cuda:{local_rank}')
     
+    # Enforce shared embeddings for mixup objective
+    if objective == 'mixup':
+        shared_embeddings = True
+        if rank == 0:
+            print(f"Note: Mixup objective requires shared embeddings. Setting shared_embeddings=True")
+    
     # Save full training configuration to JSON
     if rank == 0:
         config_json = {
@@ -644,6 +714,7 @@ def train(
             'embedding_init_strategy': embedding_init_strategy,
             'unembedding_init_strategy': unembedding_init_strategy,
             'embedding_init_noise_std': embedding_init_noise_std,
+            'mixup_alpha': mixup_alpha,
             'loss_balance_strength': loss_balance_strength,
             'loss_balance_ema_momentum': loss_balance_ema_momentum,
             'loss_balance_warmup_steps': loss_balance_warmup_steps,
@@ -712,6 +783,10 @@ def train(
             except Exception as e:
                 print(f"Warning: Failed to save script version: {e}")
             
+            # Save full training config as text
+            config_json_text = json.dumps(config_json, indent=2)
+            writer.add_text('config/training_config_json', f"```json\n{config_json_text}\n```")
+            
             writer.add_text('config/model_name', model_name)
             writer.add_text('config/dataset_name', dataset_name + (f" ({dataset_config})" if dataset_config else ""))
             writer.add_text('config/objective', objective)
@@ -725,6 +800,7 @@ def train(
             writer.add_scalar('config/max_length', max_length)
             writer.add_scalar('config/seed', seed)
             writer.add_scalar('config/world_size', world_size)
+            writer.add_scalar('config/mixup_alpha', mixup_alpha)
             writer.add_scalar('config/loss_balance_strength', loss_balance_strength)
             writer.add_scalar('config/loss_balance_ema_momentum', loss_balance_ema_momentum)
             writer.add_scalar('config/loss_balance_warmup_steps', loss_balance_warmup_steps)
@@ -756,7 +832,7 @@ def train(
     if rank == 0:
         print(f"Dataset shuffle seed for rank {rank}: {dataset_seed}")
     
-    collate_fn = DualStreamCollator(tokenizer, max_length=max_length, objective=objective)
+    collate_fn = DualStreamCollator(tokenizer, max_length=max_length, objective=objective, mixup_alpha=mixup_alpha)
     
     dataloader = DataLoader(
         dataset,
@@ -789,7 +865,7 @@ def train(
                 model.unemb_A.parameters(),
                 model.unemb_B.parameters()
             ]
-    else:  # averaged
+    else:  # averaged or mixup
         if shared_embeddings:
             trainable_params = [
                 model.emb.parameters(),
@@ -922,12 +998,12 @@ def train(
         except Exception as _e:
             print(f"[Rank {rank}] Warning: failed to fast-forward dataloader ({_e}).")
     
-    if rank == 0 and objective == 'separate':
+    if rank == 0:
         print(f"\n{'='*80}")
         print("Initial generation samples (step 0 - before training)")
         print('='*80)
         
-        samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=live_config['temperature'])
+        samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=live_config['temperature'], objective=objective)
         
         for i, sample in enumerate(samples, 1):
             print(f"\nSample {i}:")
@@ -1095,6 +1171,51 @@ def train(
             
             # Compute the average loss over all valid tokens in the batch
             # Add a small epsilon to avoid division by zero if the batch is empty
+            loss = loss.sum() / (valid_mask.float().sum() + 1e-8)
+            
+            # For logging purposes
+            loss_A = loss
+            loss_B = loss
+            alpha = 1.0
+            beta = 1.0
+
+        elif objective == 'mixup':
+            next_tokens_A = batch['next_tokens_A'].to(device)
+            next_tokens_B = batch['next_tokens_B'].to(device)
+            lambdas = batch['lambdas'].to(device)  # [batch_size]
+            pad_token_id = batch['pad_token_id']
+            
+            logits = model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B, lambdas=lambdas)
+            
+            # Use logits[:, :-1, :] to match with next_tokens
+            # Cast to float32 for numerically stable log_softmax on bf16 models
+            logits_shifted = logits[:, :-1, :].float()
+            
+            # Create mask for valid (non-padding) positions
+            valid_mask = (input_ids_A[:, :-1] != pad_token_id) & (input_ids_B[:, :-1] != pad_token_id)
+            valid_mask = valid_mask & (next_tokens_A != pad_token_id) & (next_tokens_B != pad_token_id)
+            
+            # Compute log probabilities
+            log_probs = F.log_softmax(logits_shifted, dim=-1)
+            
+            # Mixup loss: weighted cross-entropy with soft targets
+            # Target distribution: λ * one_hot(token_A) + (1-λ) * one_hot(token_B)
+            # Loss: -[λ * log(P[token_A]) + (1-λ) * log(P[token_B])]
+            
+            # Gather log probs for both target tokens
+            log_prob_A = torch.gather(log_probs, dim=-1, index=next_tokens_A.unsqueeze(-1)).squeeze(-1)
+            log_prob_B = torch.gather(log_probs, dim=-1, index=next_tokens_B.unsqueeze(-1)).squeeze(-1)
+            
+            # Expand lambdas to [batch_size, seq_len]
+            lambdas_expanded = lambdas.view(-1, 1).to(log_prob_A.dtype)
+            
+            # Mixup loss: -[λ * log(P_A) + (1-λ) * log(P_B)]
+            loss = -(lambdas_expanded * log_prob_A + (1 - lambdas_expanded) * log_prob_B)
+            
+            # Apply the mask to only compute loss for valid positions
+            loss = loss * valid_mask.float()
+            
+            # Compute the average loss over all valid tokens in the batch
             loss = loss.sum() / (valid_mask.float().sum() + 1e-8)
             
             # For logging purposes
@@ -1323,38 +1444,37 @@ def train(
                     total_loss_acc_scheduler = 0.0
                     scheduler_steps_acc = 0
 
-                if objective == 'separate':
-                    print(f"\n{'='*80}")
-                    print(f"Generation samples at step {optimizer_step}")
-                    print('='*80)
-                    
-                    samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=live_config['temperature'])
+                print(f"\n{'='*80}")
+                print(f"Generation samples at step {optimizer_step}")
+                print('='*80)
+                
+                samples = generate_samples(model, tokenizer, validation_prompts, device, max_new_tokens=max_gen_tokens, temperature=live_config['temperature'], objective=objective)
+                
+                for i, sample in enumerate(samples, 1):
+                    print(f"\nSample {i}:")
+                    print(f"  Prompt A: {sample['prompt_A']}")
+                    print(f"  Generated A: {sample['generated_A']}")
+                    print(f"  Prompt B: {sample['prompt_B']}")
+                    print(f"  Generated B: {sample['generated_B']}")
+                
+                print('='*80 + '\n')
+                
+                if writer is not None:
+                    table_header = "| Sample | Prompt A | Generated A | Prompt B | Generated B |\n"
+                    table_header += "|--------|----------|-------------|----------|-------------|\n"
+                    table_rows = ""
                     
                     for i, sample in enumerate(samples, 1):
-                        print(f"\nSample {i}:")
-                        print(f"  Prompt A: {sample['prompt_A']}")
-                        print(f"  Generated A: {sample['generated_A']}")
-                        print(f"  Prompt B: {sample['prompt_B']}")
-                        print(f"  Generated B: {sample['generated_B']}")
-                    
-                    print('='*80 + '\n')
-                    
-                    if writer is not None:
-                        table_header = "| Sample | Prompt A | Generated A | Prompt B | Generated B |\n"
-                        table_header += "|--------|----------|-------------|----------|-------------|\n"
-                        table_rows = ""
+                        prompt_a = sample['prompt_A'].replace('\n', ' ')[:100]
+                        gen_a = sample['generated_A'].replace('\n', ' ')[:200]
+                        prompt_b = sample['prompt_B'].replace('\n', ' ')[:100]
+                        gen_b = sample['generated_B'].replace('\n', ' ')[:200]
                         
-                        for i, sample in enumerate(samples, 1):
-                            prompt_a = sample['prompt_A'].replace('\n', ' ')[:100]
-                            gen_a = sample['generated_A'].replace('\n', ' ')[:200]
-                            prompt_b = sample['prompt_B'].replace('\n', ' ')[:100]
-                            gen_b = sample['generated_B'].replace('\n', ' ')[:200]
-                            
-                            table_rows += f"| {i} | {prompt_a} | {gen_a} | {prompt_b} | {gen_b} |\n"
-                        
-                        table_markdown = table_header + table_rows
-                        writer.add_text(f'generation_samples/step_{optimizer_step:07d}', table_markdown, optimizer_step)
-                        writer.flush()
+                        table_rows += f"| {i} | {prompt_a} | {gen_a} | {prompt_b} | {gen_b} |\n"
+                    
+                    table_markdown = table_header + table_rows
+                    writer.add_text(f'generation_samples/step_{optimizer_step:07d}', table_markdown, optimizer_step)
+                    writer.flush()
             
             # Checkpointing
             if rank == 0 and optimizer_step > 0 and optimizer_step % save_interval == 0:
