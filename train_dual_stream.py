@@ -3,7 +3,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, BitsAndBytesConfig
 from datasets import load_dataset
 import os
 import functools
@@ -44,7 +44,7 @@ def train(
     output_dir='./checkpoints',
     tensorboard_log_dir='./tensorboard_logs',
     # Training objective
-    objective='separate',  # 'separate', 'averaged', or 'mixup'
+    objective='separate',  # 'separate', 'averaged', 'mixup', or 'distillation'
     use_loss_balancing=True,
     shared_embeddings=False,  # Use single shared embedding matrix instead of separate emb_A and emb_B
     # Embedding initialization
@@ -53,6 +53,10 @@ def train(
     embedding_init_noise_std=0.01,
     # Mixup parameters
     mixup_alpha=0.4,  # Alpha parameter for Beta distribution in mixup: λ ~ Beta(α, α)
+    # Distillation parameters
+    teacher_model_name=None,  # Teacher model name. If None, uses same as model_name
+    teacher_load_in_8bit=True,  # Load teacher in 8-bit quantization mode
+    distillation_temperature=2.0,  # Temperature for softening teacher distributions
     # Loss balancing parameters
     loss_balance_strength=5.0,
     loss_balance_ema_momentum=0.99,
@@ -112,6 +116,12 @@ def train(
         if rank == 0:
             print(f"Note: Mixup objective requires shared embeddings. Setting shared_embeddings=True")
     
+    # Enforce shared embeddings for distillation objective
+    if objective == 'distillation':
+        shared_embeddings = True
+        if rank == 0:
+            print(f"Note: Distillation objective requires shared embeddings. Setting shared_embeddings=True")
+    
     # Save full training configuration to JSON
     if rank == 0:
         config_json = _create_config_dict(
@@ -122,7 +132,8 @@ def train(
             embedding_init_strategy, unembedding_init_strategy, embedding_init_noise_std,
             mixup_alpha, loss_balance_strength, loss_balance_ema_momentum,
             loss_balance_warmup_steps, loss_balance_clip_min, loss_balance_clip_max,
-            lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps
+            lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps,
+            teacher_model_name, teacher_load_in_8bit, distillation_temperature
         )
         
         config_json_path = os.path.join(output_dir, 'training_config.json')
@@ -173,13 +184,9 @@ def train(
     collate_fn = DualStreamCollator(tokenizer, max_length=max_length, objective=objective, mixup_alpha=mixup_alpha)
     dataloader = DataLoader(dataset, batch_size=batch_size * 2, collate_fn=collate_fn)
     
-    # Create model
-    base_model_config = AutoConfig.from_pretrained(model_name)
-    vocab_size = base_model_config.vocab_size
-    hidden_dim = base_model_config.hidden_size
-    
     model = DualStreamLLM(
-        model_name, vocab_size, hidden_dim, freeze_backbone=freeze_backbone,
+        model_name=model_name,
+        freeze_backbone=freeze_backbone,
         embedding_init_strategy=embedding_init_strategy,
         unembedding_init_strategy=unembedding_init_strategy,
         embedding_init_noise_std=embedding_init_noise_std,
@@ -190,6 +197,16 @@ def train(
     # Print parameter counts
     if rank == 0:
         _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings)
+    
+    # Load teacher model for distillation
+    teacher_model = None
+    if objective == 'distillation':
+        teacher_model = _load_teacher_model(
+            teacher_model_name if teacher_model_name else model_name,
+            teacher_load_in_8bit,
+            device,
+            rank
+        )
     
     # Wrap model with FSDP if distributed
     if world_size > 1:
@@ -248,6 +265,8 @@ def train(
         validation_prompts=validation_prompts,
         resume_step=resume_step,
         checkpoint_data=checkpoint_data,
+        teacher_model=teacher_model,
+        distillation_temperature=distillation_temperature,
     )
     
     # Train
@@ -341,6 +360,40 @@ def _handle_continue_run(
     return output_dir, tensorboard_log_dir, resume_step, checkpoint_data, old_tensorboard_dir
 
 
+def _load_teacher_model(model_name: str, load_in_8bit: bool, device, rank: int):
+    """Load teacher model for distillation."""
+    if rank == 0:
+        print(f"\n{'='*80}")
+        print(f"Loading teacher model: {model_name}")
+        print(f"8-bit quantization: {load_in_8bit}")
+        print(f"{'='*80}\n")
+    
+    if load_in_8bit:
+        # Use BitsAndBytesConfig for 8-bit quantization
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map='auto',
+            quantization_config=quantization_config,
+            torch_dtype=torch.float16,
+        )
+    else:
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+        )
+        teacher = teacher.to(device)
+    
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad = False
+    
+    if rank == 0:
+        print(f"Teacher model loaded successfully\n")
+    
+    return teacher
+
+
 def _create_config_dict(
     model_name, dataset_name, dataset_config, dataset_split, device,
     batch_size, learning_rate, backbone_lr, freeze_backbone, num_train_steps,
@@ -349,7 +402,8 @@ def _create_config_dict(
     embedding_init_strategy, unembedding_init_strategy, embedding_init_noise_std,
     mixup_alpha, loss_balance_strength, loss_balance_ema_momentum,
     loss_balance_warmup_steps, loss_balance_clip_min, loss_balance_clip_max,
-    lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps
+    lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps,
+    teacher_model_name, teacher_load_in_8bit, distillation_temperature
 ):
     """Create configuration dictionary."""
     return {
@@ -378,6 +432,9 @@ def _create_config_dict(
         'unembedding_init_strategy': unembedding_init_strategy,
         'embedding_init_noise_std': embedding_init_noise_std,
         'mixup_alpha': mixup_alpha,
+        'teacher_model_name': teacher_model_name,
+        'teacher_load_in_8bit': teacher_load_in_8bit,
+        'distillation_temperature': distillation_temperature,
         'loss_balance_strength': loss_balance_strength,
         'loss_balance_ema_momentum': loss_balance_ema_momentum,
         'loss_balance_warmup_steps': loss_balance_warmup_steps,
@@ -443,7 +500,7 @@ def _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings
                 model.unemb_A.parameters(),
                 model.unemb_B.parameters()
             ]
-    else:  # averaged or mixup
+    else:  # averaged, mixup, or distillation
         if shared_embeddings:
             trainable_params = [
                 model.emb.parameters(),

@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+
+from transformers import AutoModelForCausalLM, AutoConfig
+
 
 class DualStreamLLM(nn.Module):
-    def __init__(self, model_name, vocab_size, hidden_dim, freeze_backbone=True,
+    def __init__(self, model_name, freeze_backbone=True,
                  embedding_init_strategy='random', embedding_init_noise_std=0.01,
                  unembedding_init_strategy=None,
                  objective='separate', shared_embeddings=False):
@@ -20,6 +22,10 @@ class DualStreamLLM(nn.Module):
             use_cache=False
         )
         
+        base_model_config = AutoConfig.from_pretrained(model_name)
+        vocab_size = base_model_config.vocab_size
+        hidden_dim = base_model_config.hidden_size
+        
         # Embedding initialization
         if shared_embeddings:
             # Single shared embedding matrix for both streams
@@ -33,7 +39,7 @@ class DualStreamLLM(nn.Module):
         if objective == 'separate':
             self.unemb_A = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
             self.unemb_B = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
-        elif objective == 'averaged' or objective == 'mixup':
+        elif objective == 'averaged' or objective == 'mixup' or objective == 'distillation':
             self.unemb = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
         else:
             raise ValueError(f"Unknown objective: {objective}")
@@ -82,6 +88,15 @@ class DualStreamLLM(nn.Module):
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
+
+        if hasattr(self.backbone, 'model'):
+            self.transformer = self.backbone.model
+        elif hasattr(self.backbone, 'transformer'):
+            self.transformer = self.backbone.transformer
+        elif hasattr(self.backbone, 'gpt_neox'):
+            self.transformer = self.backbone.gpt_neox
+        else:
+            raise AttributeError("The backbone model does not have a standard transformer attribute ('model', 'transformer', 'gpt_neox').")
         
     def forward(self, input_ids_A, attention_mask_A, input_ids_B, attention_mask_B, lambdas=None):
         # Get embeddings
@@ -108,7 +123,7 @@ class DualStreamLLM(nn.Module):
         # This prevents empty attention masks when sequences have different lengths
         attention_mask = torch.maximum(attention_mask_A, attention_mask_B)
         
-        transformer_outputs = self.backbone.model(
+        transformer_outputs = self.transformer(
             inputs_embeds=fused_embeds,
             attention_mask=attention_mask,
             output_hidden_states=True,
@@ -121,7 +136,7 @@ class DualStreamLLM(nn.Module):
             logits_A = self.unemb_A(last_hidden_state)
             logits_B = self.unemb_B(last_hidden_state)
             return logits_A, logits_B
-        elif self.objective == 'averaged' or self.objective == 'mixup':
+        elif self.objective == 'averaged' or self.objective == 'mixup' or self.objective == 'distillation':
             logits = self.unemb(last_hidden_state)
             return logits
         else:

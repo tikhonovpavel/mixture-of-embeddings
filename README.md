@@ -191,6 +191,32 @@ class Trainer:
     --use_loss_balancing=True
 ```
 
+### Training with Distillation
+
+The distillation objective uses a teacher model to create soft targets by averaging the probability distributions from both text streams:
+
+```bash
+ python train_dual_stream.py \
+    --model_name='HuggingFaceTB/SmolLM2-135M' \
+    --dataset_name='roneneldan/TinyStories' \
+    --num_train_steps=200000 \
+    --objective='distillation' \
+    --teacher_model_name='HuggingFaceTB/SmolLM2-135M' \
+    --teacher_load_in_8bit=True \
+    --distillation_temperature=2.0
+```
+
+**How it works:**
+1. For each batch, the teacher model processes both text streams A and B separately (without mixing embeddings)
+2. The teacher produces soft probability distributions P_teacher_A and P_teacher_B using temperature scaling
+3. The target distribution is computed as: P_target = 0.5 * P_teacher_A + 0.5 * P_teacher_B
+4. The student model (with mixed embeddings) is trained using KL divergence between its predictions and P_target
+
+**Parameters:**
+- `teacher_model_name`: Name of the teacher model (defaults to same as student model)
+- `teacher_load_in_8bit`: Load teacher in 8-bit quantization mode to save memory (default: True)
+- `distillation_temperature`: Temperature for softening distributions (default: 2.0)
+
 ### Using Individual Modules
 
 ```python

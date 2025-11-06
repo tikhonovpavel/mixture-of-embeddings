@@ -181,8 +181,6 @@ def load_model_from_checkpoint(checkpoint_path, config, device='cuda'):
     # Create model
     model = DualStreamLLM(
         model_name=config['model_name'],
-        vocab_size=50257,  # Will be overridden by actual vocab size
-        hidden_dim=576,     # SmolLM2-135M hidden size
         freeze_backbone=True,  # For evaluation, we don't need gradients
         embedding_init_strategy=config.get('embedding_init_strategy', 'copy'),
         unembedding_init_strategy=config.get('unembedding_init_strategy', 'copy'),
@@ -206,8 +204,6 @@ def load_base_model(model_name, objective='mixup', shared_embeddings=True, devic
     
     model = DualStreamLLM(
         model_name=model_name,
-        vocab_size=50257,
-        hidden_dim=576,
         freeze_backbone=True,
         embedding_init_strategy='copy',
         unembedding_init_strategy='copy',

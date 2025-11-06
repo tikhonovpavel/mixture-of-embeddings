@@ -272,15 +272,10 @@ def evaluate(
 
     # Load dual-stream model
     print(f"Loading dual-stream model from checkpoint: {checkpoint_path}")
-    base_model_config = AutoConfig.from_pretrained(model_name)
-    vocab_size = base_model_config.vocab_size
-    hidden_dim = base_model_config.hidden_size
     
     # We need the full definition of DualStreamLLM to load it
     dual_stream_model = DualStreamLLM(
         model_name=model_name,
-        vocab_size=vocab_size,
-        hidden_dim=hidden_dim,
         freeze_backbone=True,  # This doesn't matter for evaluation
         objective=objective,
         shared_embeddings=shared_embeddings

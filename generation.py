@@ -21,7 +21,7 @@ def generate_samples(
         device: Device to run generation on
         max_new_tokens: Maximum number of tokens to generate
         temperature: Sampling temperature
-        objective: Training objective ('separate', 'averaged', or 'mixup')
+        objective: Training objective ('separate', 'averaged', 'mixup', or 'distillation')
     
     Returns:
         List of dicts with 'prompt_A', 'prompt_B', 'generated_A', 'generated_B'
@@ -74,8 +74,8 @@ def generate_samples(
                 generated_A = tokenizer.decode(input_ids_A[0], skip_special_tokens=True)
                 generated_B = tokenizer.decode(input_ids_B[0], skip_special_tokens=True)
             
-            elif objective in ['averaged', 'mixup']:
-                # For averaged/mixup objective, generate from each stream independently using pure inputs
+            elif objective in ['averaged', 'mixup', 'distillation']:
+                # For averaged/mixup/distillation objective, generate from each stream independently using pure inputs
                 # Stream A: use lambda=1 (pure A)
                 for _ in range(max_new_tokens):
                     # For pure A generation, pass same input for both streams (or use lambda=1)

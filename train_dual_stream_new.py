@@ -179,7 +179,8 @@ def train(
     hidden_dim = base_model_config.hidden_size
     
     model = DualStreamLLM(
-        model_name, vocab_size, hidden_dim, freeze_backbone=freeze_backbone,
+        model_name=model_name,
+        freeze_backbone=freeze_backbone,
         embedding_init_strategy=embedding_init_strategy,
         unembedding_init_strategy=unembedding_init_strategy,
         embedding_init_noise_std=embedding_init_noise_std,

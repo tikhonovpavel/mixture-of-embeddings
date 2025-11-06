@@ -11,7 +11,7 @@ class DualStreamCollator:
         Args:
             tokenizer: Tokenizer for encoding text
             max_length: Maximum sequence length
-            objective: Training objective ('separate', 'averaged', or 'mixup')
+            objective: Training objective ('separate', 'averaged', 'mixup', or 'distillation')
             mixup_alpha: Alpha parameter for Beta distribution in mixup
         """
         self.tokenizer = tokenizer
@@ -77,8 +77,8 @@ class DualStreamCollator:
                 'labels_B': labels_B,
             }
         
-        elif self.objective == 'averaged':
-            # For averaged objective, we need to create target distributions
+        elif self.objective == 'averaged' or self.objective == 'distillation':
+            # For averaged/distillation objective, we need to create target distributions
             # Get next token ids
             next_tokens_A = encoded_A['input_ids'][:, 1:].clone()
             next_tokens_B = encoded_B['input_ids'][:, 1:].clone()

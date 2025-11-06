@@ -62,6 +62,9 @@ class Trainer:
         # Resume
         resume_step: int = 0,
         checkpoint_data: dict = None,
+        # Distillation
+        teacher_model = None,
+        distillation_temperature: float = 2.0,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -97,6 +100,9 @@ class Trainer:
         self.validation_prompts = validation_prompts
         
         self.resume_step = resume_step
+        
+        self.teacher_model = teacher_model
+        self.distillation_temperature = distillation_temperature
         
         # Setup managers
         self.checkpoint_manager = CheckpointManager(output_dir)
@@ -147,7 +153,7 @@ class Trainer:
                     self.model.unemb_A.parameters(),
                     self.model.unemb_B.parameters()
                 ]
-        else:  # averaged or mixup
+        else:  # averaged, mixup, or distillation
             if self.shared_embeddings:
                 trainable_params = [
                     self.model.emb.parameters(),
@@ -318,6 +324,60 @@ class Trainer:
         
         return loss, loss
     
+    def _compute_loss_distillation(self, batch):
+        """Compute loss for 'distillation' objective using KL divergence."""
+        input_ids_A = batch['input_ids_A'].to(self.device)
+        attention_mask_A = batch['attention_mask_A'].to(self.device)
+        input_ids_B = batch['input_ids_B'].to(self.device)
+        attention_mask_B = batch['attention_mask_B'].to(self.device)
+        pad_token_id = batch['pad_token_id']
+        
+        # Get teacher predictions for both streams separately
+        with torch.no_grad():
+            # Teacher predictions for stream A
+            teacher_outputs_A = self.teacher_model(
+                input_ids=input_ids_A,
+                attention_mask=attention_mask_A,
+            )
+            teacher_logits_A = teacher_outputs_A.logits[:, :-1, :].float()
+            
+            # Teacher predictions for stream B
+            teacher_outputs_B = self.teacher_model(
+                input_ids=input_ids_B,
+                attention_mask=attention_mask_B,
+            )
+            teacher_logits_B = teacher_outputs_B.logits[:, :-1, :].float()
+            
+            # Apply temperature and compute soft targets
+            teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
+            teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+            
+            # Average the teacher distributions: P_target = 0.5 * P_A + 0.5 * P_B
+            target_probs = 0.5 * teacher_probs_A + 0.5 * teacher_probs_B
+        
+        # Get student predictions on mixed embeddings
+        student_logits = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
+        student_logits = student_logits[:, :-1, :].float()
+        
+        # Apply temperature to student logits
+        student_log_probs = F.log_softmax(student_logits / self.distillation_temperature, dim=-1)
+        
+        # Create mask for valid (non-padding) positions
+        valid_mask = (input_ids_A[:, :-1] != pad_token_id) & (input_ids_B[:, :-1] != pad_token_id)
+        
+        # Compute KL divergence: KL(target || student) = sum(target * log(target/student))
+        # = sum(target * (log(target) - log(student)))
+        kl_div = (target_probs * (torch.log(target_probs + 1e-10) - student_log_probs)).sum(dim=-1)
+        
+        # Apply mask and compute average
+        kl_div = kl_div * valid_mask.float()
+        loss = kl_div.sum() / (valid_mask.float().sum() + 1e-8)
+        
+        # Scale loss by temperature^2 (standard practice in distillation)
+        loss = loss * (self.distillation_temperature ** 2)
+        
+        return loss, loss
+    
     def _update_loss_balancing_coefficients(self, step: int):
         """Update alpha and beta coefficients for loss balancing."""
         if not self.use_loss_balancing or self.objective != 'separate':
@@ -484,6 +544,10 @@ class Trainer:
                 self.alpha, self.beta = 1.0, 1.0
             elif self.objective == 'mixup':
                 loss, loss_A = self._compute_loss_mixup(batch)
+                loss_B = loss_A
+                self.alpha, self.beta = 1.0, 1.0
+            elif self.objective == 'distillation':
+                loss, loss_A = self._compute_loss_distillation(batch)
                 loss_B = loss_A
                 self.alpha, self.beta = 1.0, 1.0
             

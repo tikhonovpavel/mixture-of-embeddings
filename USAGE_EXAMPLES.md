@@ -341,8 +341,6 @@ dataset = dataset.shuffle(seed=42, buffer_size=10000)
 config = AutoConfig.from_pretrained('HuggingFaceTB/SmolLM2-135M')
 model = DualStreamLLM(
     'HuggingFaceTB/SmolLM2-135M',
-    config.vocab_size,
-    config.hidden_size,
     freeze_backbone=False,
     objective='separate',
     shared_embeddings=False
