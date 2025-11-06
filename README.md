@@ -236,6 +236,4 @@ mixture-of-embeddings/
 ├── collator.py                   # Batch preparation (126 lines)
 ├── utils.py                      # Utilities (65 lines)
 ├── model.py                      # (existing file)
-├── REFACTORING_NOTES.md          # This file
-└── ...
 ```
