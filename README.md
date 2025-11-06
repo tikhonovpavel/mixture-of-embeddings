@@ -227,13 +227,13 @@ print(f"Similarity: {similarity}")
 
 ```
 mixture-of-embeddings/
-├── train_dual_stream.py          # Entry point (479 lines)
-├── trainer.py                    # Main Trainer class (712 lines)
-├── checkpoint_manager.py         # Checkpoint management (77 lines)
-├── config_manager.py             # Configuration management (119 lines)
-├── logger.py                     # TensorBoard logging (325 lines)
-├── generation.py                 # Text generation (160 lines)
-├── collator.py                   # Batch preparation (126 lines)
-├── utils.py                      # Utilities (65 lines)
-├── model.py                      # (existing file)
+├── train_dual_stream.py          # Entry point
+├── trainer.py                    # Main Trainer class
+├── checkpoint_manager.py         # Checkpoint management
+├── config_manager.py             # Configuration management
+├── logger.py                     # TensorBoard logging
+├── generation.py                 # Text generation
+├── collator.py                   # Batch preparation
+├── utils.py                      # Utilities
+└── model.py                      # Model
 ```
