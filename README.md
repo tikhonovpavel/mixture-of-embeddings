@@ -2,7 +2,7 @@
 
 ## Overview
 
-### 1. `train_dual_stream.py` (479 lines) — Entry Point
+### 1. `train_dual_stream.py` — Entry Point
 
 **The main function** that coordinates the entire training process.
 
@@ -19,7 +19,7 @@
 
 ---
 
-### 2. `checkpoint_manager.py` (77 lines) — Checkpoint Management
+### 2. `checkpoint_manager.py` — Checkpoint Management
 **Responsible for:** Loading and saving model checkpoints.
 
 **Main methods:**
@@ -37,7 +37,7 @@ class CheckpointManager:
 
 ---
 
-### 3. `config_manager.py` (119 lines) — Configuration Management
+### 3. `config_manager.py` — Configuration Management
 **Responsible for:** Loading, saving, and applying the "live" configuration.
 
 **Main methods:**
@@ -56,7 +56,7 @@ class ConfigManager:
 
 ---
 
-### 4. `logger.py` (325 lines) — TensorBoard Logging
+### 4. `logger.py` — TensorBoard Logging
 **Responsible for:** All logging functionality to TensorBoard.
 
 **Main methods:**
@@ -81,7 +81,7 @@ class TrainingLogger:
 
 ---
 
-### 5. `generation.py` (160 lines) — Text Generation
+### 5. `generation.py` — Text Generation
 **Responsible for:** Generating text from the model during training.
 
 **Main functions:**
@@ -101,7 +101,7 @@ def generate_samples(model, tokenizer, prompts, device, max_new_tokens, temperat
 
 ---
 
-### 6. `collator.py` (126 lines) — Batch Preparation
+### 6. `collator.py` — Batch Preparation
 **Responsible for:** Creating batches for the two training streams.
 
 **Main logic:**
@@ -123,7 +123,7 @@ class DualStreamCollator:
 
 ---
 
-### 7. `utils.py` (65 lines) — Utilities
+### 7. `utils.py` — Utilities
 **Responsible for:** General-purpose helper functions.
 
 **Contains:**
@@ -142,7 +142,7 @@ class DualStreamCollator:
 
 ---
 
-### 8. `trainer.py` (712 lines) — Main Trainer Class
+### 8. `trainer.py` — Main Trainer Class
 **Responsible for:** Coordinating the training process.
 
 **Main structure:**
