@@ -1,3 +1,6 @@
+import sys
+import types
+
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -28,12 +31,12 @@ def train(
     dataset_config=None,
     dataset_split='train',
     device=None,
-    batch_size=32,
+    batch_size=8,
     learning_rate=1e-3,
     backbone_lr=1e-4,
     freeze_backbone=False,
     num_train_steps=200_000,
-    max_length=4096,
+    max_length=1024,
     log_interval=1,
     similarity_log_interval=50,
     eval_interval=500,
@@ -69,7 +72,7 @@ def train(
     # Resume parameters
     resume_from_checkpoint=None,
     continue_run=None,
-    gradient_accumulation_steps=1
+    gradient_accumulation_steps=2
 ):
     """Main training function."""
     # Set seed for reproducibility
@@ -375,12 +378,12 @@ def _load_teacher_model(model_name: str, load_in_8bit: bool, device, rank: int):
             model_name,
             device_map='auto',
             quantization_config=quantization_config,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
     else:
         teacher = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
         teacher = teacher.to(device)
     
