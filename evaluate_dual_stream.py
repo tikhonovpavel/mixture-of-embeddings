@@ -319,7 +319,9 @@ def evaluate(
     eval_len=32,
     top_k_mask=30,
     device='cuda',
-    seed=42
+    seed=42,
+    num_train_steps=500_000,
+    train_batch_size=8
 ):
     """
     Evaluate dual-stream generation quality.
@@ -337,6 +339,8 @@ def evaluate(
         top_k_mask: Top-K for mask creation
         device: Device to use
         seed: Random seed
+        num_train_steps: Number of training steps used during training (to skip train data)
+        train_batch_size: Batch size used during training (to skip train data)
     """
     torch.manual_seed(seed)
     device = torch.device(device)
@@ -391,7 +395,22 @@ def evaluate(
     else:
         dataset = load_dataset(dataset_name, split='train', streaming=True, trust_remote_code=True)
     
+    # Use same seed as training to get the same data order
     dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+    
+    # (because we need pairs of texts for dual-stream training)
+    num_train_samples = num_train_steps * train_batch_size * 2
+    
+    # Manually skip samples with progress bar
+    dataset_iter = iter(dataset)
+    print(f"Skipping first {num_train_samples:,} samples (used during training)...")
+    for _ in tqdm(range(num_train_samples), desc="Skipping train samples"):
+        try:
+            next(dataset_iter)
+        except StopIteration:
+            print("Warning: Dataset exhausted before all training samples could be skipped.")
+            break
+    print(f"Skipped {num_train_samples:,} samples. Using subsequent data for evaluation.")
     
     print(f"\n{'='*80}")
     print(f"EVALUATION CONFIGURATION")
@@ -404,7 +423,11 @@ def evaluate(
     print(f"Base Model: {model_name}")
     print(f"Separator model: {separator_model_name if use_separator_model else 'N/A'}")
     print(f"Dataset: {dataset_name}")
-    print(f"Number of samples: {num_samples}")
+    print(f"Seed: {seed}")
+    print(f"Train steps skipped: {num_train_steps:,}")
+    print(f"Train batch size: {train_batch_size}")
+    print(f"Train samples skipped: {num_train_samples:,}")
+    print(f"Number of eval samples: {num_samples}")
     print(f"Context length: {context_len}")
     print(f"Eval length: {eval_len}")
     print(f"Top-K mask: {top_k_mask if use_separator_model else 'N/A'}")
@@ -412,7 +435,7 @@ def evaluate(
     
     # Evaluate
     results = []
-    dataset_iter = iter(dataset)
+    # The dataset_iter is already advanced past the training samples
     
     with tqdm(total=num_samples, desc="Evaluating") as pbar:
         while len(results) < num_samples:
@@ -585,6 +608,357 @@ def evaluate(
     return avg_metrics, std_metrics
 
 
+def forward_with_embedding_scale(dual_model, input_ids, attention_mask, embedding_scale=1.0):
+    """
+    Forward pass through dual model with scaled embeddings.
+    For single-stream mode with embedding scale adjustment.
+    """
+    # Get embeddings
+    if dual_model.shared_embeddings:
+        embeds = dual_model.emb(input_ids)
+    else:
+        embeds = dual_model.emb_A(input_ids)
+    
+    # Apply scale (for single-stream, use sqrt(2)/2 to match dual-stream norm)
+    scaled_embeds = embeds * embedding_scale
+    
+    # Forward through transformer
+    transformer_outputs = dual_model.transformer(
+        inputs_embeds=scaled_embeds,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        return_dict=True
+    )
+    
+    last_hidden_state = transformer_outputs.last_hidden_state
+    
+    # Unembedding
+    if dual_model.objective == 'separate':
+        logits = dual_model.unemb_A(last_hidden_state)
+    else:
+        logits = dual_model.unemb(last_hidden_state)
+    
+    return logits
+
+
+def evaluate_single_stream_pair(
+    dual_model,
+    vanilla_model,
+    tokenizer,
+    text,
+    context_len=32,
+    eval_len=32,
+    embedding_scale=1.0,
+    device='cuda'
+):
+    """
+    Evaluate dual model in single-stream mode (same text in both streams).
+    Compare with vanilla model predictions.
+    
+    Args:
+        embedding_scale: Scale factor for embeddings. Use sqrt(2)/2 ≈ 0.707 
+                        to match expected norm from dual-stream training.
+    
+    Returns:
+        Dictionary with metrics
+    """
+    # Tokenize full text
+    full_tokens = tokenizer.encode(text, return_tensors='pt').to(device)
+    
+    # Split into context and target
+    context_tokens = full_tokens[:, :context_len]
+    target_tokens = full_tokens[:, context_len:context_len+eval_len]
+    
+    if target_tokens.shape[1] == 0:
+        return None
+    
+    # Metrics accumulators
+    dual_log_probs = []
+    vanilla_log_probs = []
+    dual_correct = 0
+    vanilla_correct = 0
+    dual_matches_vanilla = 0
+    dual_ranks = []
+    vanilla_ranks = []
+    vanilla_token_rank_in_dual = []  # Rank of vanilla's top-1 in dual's distribution
+    
+    total_steps = 0
+    
+    with torch.no_grad():
+        eval_steps = min(eval_len, target_tokens.shape[1])
+        if eval_steps == 0:
+            return None
+        total_steps = eval_steps
+        
+        for step in range(total_steps):
+            current_context = full_tokens[:, :context_len + step]
+            target_token = full_tokens[:, context_len + step]
+            
+            # Dual model with embedding scale
+            dual_logits = forward_with_embedding_scale(
+                dual_model,
+                input_ids=current_context,
+                attention_mask=torch.ones_like(current_context),
+                embedding_scale=embedding_scale
+            )
+            dual_logits_next = dual_logits[:, -1, :]
+            
+            # Vanilla model
+            vanilla_outputs = vanilla_model(current_context)
+            vanilla_logits_next = vanilla_outputs.logits[:, -1, :]
+            
+            # --- Metrics ---
+            
+            # Log probs for perplexity
+            dual_log_probs_dist = F.log_softmax(dual_logits_next, dim=-1)
+            dual_log_prob = dual_log_probs_dist.gather(1, target_token.unsqueeze(1)).squeeze().item()
+            dual_log_probs.append(dual_log_prob)
+            
+            vanilla_log_probs_dist = F.log_softmax(vanilla_logits_next, dim=-1)
+            vanilla_log_prob = vanilla_log_probs_dist.gather(1, target_token.unsqueeze(1)).squeeze().item()
+            vanilla_log_probs.append(vanilla_log_prob)
+            
+            # Accuracy (argmax == ground truth)
+            dual_pred = torch.argmax(dual_logits_next, dim=-1)
+            vanilla_pred = torch.argmax(vanilla_logits_next, dim=-1)
+            
+            if dual_pred.item() == target_token.item():
+                dual_correct += 1
+            if vanilla_pred.item() == target_token.item():
+                vanilla_correct += 1
+            if dual_pred.item() == vanilla_pred.item():
+                dual_matches_vanilla += 1
+            
+            # Rank of true token
+            dual_sorted = torch.argsort(dual_logits_next, dim=-1, descending=True)
+            dual_rank = (dual_sorted == target_token.unsqueeze(-1)).nonzero(as_tuple=True)[1].item() + 1
+            dual_ranks.append(dual_rank)
+            
+            vanilla_sorted = torch.argsort(vanilla_logits_next, dim=-1, descending=True)
+            vanilla_rank = (vanilla_sorted == target_token.unsqueeze(-1)).nonzero(as_tuple=True)[1].item() + 1
+            vanilla_ranks.append(vanilla_rank)
+            
+            # Rank of vanilla's top-1 token in dual's distribution
+            vanilla_top1_rank_in_dual = (dual_sorted == vanilla_pred.unsqueeze(-1)).nonzero(as_tuple=True)[1].item() + 1
+            vanilla_token_rank_in_dual.append(vanilla_top1_rank_in_dual)
+    
+    return {
+        'dual_perplexity': np.exp(-np.mean(dual_log_probs)),
+        'vanilla_perplexity': np.exp(-np.mean(vanilla_log_probs)),
+        'dual_accuracy': dual_correct / total_steps,
+        'vanilla_accuracy': vanilla_correct / total_steps,
+        'dual_matches_vanilla': dual_matches_vanilla / total_steps,
+        'dual_avg_rank': np.mean(dual_ranks),
+        'vanilla_avg_rank': np.mean(vanilla_ranks),
+        'vanilla_top1_rank_in_dual': np.mean(vanilla_token_rank_in_dual),
+    }
+
+
+def evaluate_single_stream(
+    checkpoint_path=None,
+    model_name='EleutherAI/pythia-2.8b',
+    dataset_name='HuggingFaceFW/fineweb',
+    dataset_config=None,
+    num_samples=100,
+    context_len=32,
+    eval_len=32,
+    embedding_scale=1.0,
+    device='cuda',
+    seed=42,
+    num_train_steps=500_000,
+    train_batch_size=8
+):
+    """
+    Evaluate dual-stream model in single-stream mode (no mixing).
+    This tests if the model has degraded on normal (non-mixed) text.
+    
+    Args:
+        checkpoint_path: Path to trained DualStreamLLM checkpoint
+        model_name: Name of the base model
+        dataset_name: Dataset to use for evaluation
+        dataset_config: Dataset config
+        num_samples: Number of texts to evaluate
+        context_len: Number of context tokens
+        eval_len: Number of tokens to evaluate
+        embedding_scale: Scale factor for embeddings. Use sqrt(2)/2 ≈ 0.707
+                        to match expected norm from dual-stream training.
+        device: Device to use
+        seed: Random seed
+        num_train_steps: Number of training steps (to skip train data)
+        train_batch_size: Batch size used during training
+    """
+    torch.manual_seed(seed)
+    device = torch.device(device)
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load dual-stream model
+    if checkpoint_path:
+        dual_model = load_checkpoint(checkpoint_path, model_name, device)
+    else:
+        print("\nNo checkpoint provided. Loading vanilla pre-trained model into DualStreamLLM structure.")
+        dual_model = DualStreamLLM(
+            model_name=model_name,
+            freeze_backbone=True,
+            embedding_init_strategy='copy',
+            objective='distillation',
+            shared_embeddings=True
+        ).to(device)
+        dual_model.eval()
+        print("Vanilla model loaded successfully.")
+    
+    # Load vanilla model for comparison
+    print(f"\nLoading vanilla model for comparison: {model_name}")
+    vanilla_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    vanilla_model.eval()
+    print("Vanilla model loaded successfully")
+    
+    # Load dataset
+    print(f"\nLoading dataset: {dataset_name}")
+    if dataset_config:
+        dataset = load_dataset(dataset_name, dataset_config, split='train', streaming=True, trust_remote_code=True)
+    else:
+        dataset = load_dataset(dataset_name, split='train', streaming=True, trust_remote_code=True)
+    
+    dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+    
+    # Skip training samples
+    num_train_samples = num_train_steps * train_batch_size * 2
+    dataset_iter = iter(dataset)
+    print(f"Skipping first {num_train_samples:,} samples (used during training)...")
+    for _ in tqdm(range(num_train_samples), desc="Skipping train samples"):
+        try:
+            next(dataset_iter)
+        except StopIteration:
+            print("Warning: Dataset exhausted before all training samples could be skipped.")
+            break
+    
+    print(f"\n{'='*80}")
+    print(f"SINGLE-STREAM EVALUATION (no mixing)")
+    print(f"{'='*80}")
+    if checkpoint_path:
+        print(f"Mode: Evaluating CHECKPOINT '{checkpoint_path}'")
+    else:
+        print(f"Mode: Evaluating VANILLA pre-trained model")
+    print(f"Base Model: {model_name}")
+    print(f"Dataset: {dataset_name}")
+    print(f"Seed: {seed}")
+    print(f"Number of eval samples: {num_samples}")
+    print(f"Context length: {context_len}")
+    print(f"Eval length: {eval_len}")
+    print(f"Embedding scale: {embedding_scale}")
+    print(f"{'='*80}\n")
+    
+    # Evaluate
+    results = []
+    
+    with tqdm(total=num_samples, desc="Evaluating") as pbar:
+        while len(results) < num_samples:
+            try:
+                sample = next(dataset_iter)
+                
+                # Extract text
+                if 'text' in sample:
+                    text = sample['text']
+                elif 'content' in sample:
+                    text = sample['content']
+                else:
+                    continue
+                
+                # Tokenize and check length
+                tokens = tokenizer.encode(text)
+                required_len = context_len + eval_len
+                if len(tokens) < required_len:
+                    continue
+                
+                # Truncate to required length
+                text = tokenizer.decode(tokens[:required_len])
+                
+                # Evaluate
+                metrics = evaluate_single_stream_pair(
+                    dual_model=dual_model,
+                    vanilla_model=vanilla_model,
+                    tokenizer=tokenizer,
+                    text=text,
+                    context_len=context_len,
+                    eval_len=eval_len,
+                    embedding_scale=embedding_scale,
+                    device=device
+                )
+                
+                if metrics is not None:
+                    results.append(metrics)
+                    pbar.update(1)
+                    
+            except StopIteration:
+                print("Dataset exhausted before reaching num_samples")
+                break
+    
+    if len(results) == 0:
+        print("No valid results collected!")
+        return
+    
+    # Aggregate statistics
+    avg_metrics = {
+        'dual_perplexity': np.mean([r['dual_perplexity'] for r in results]),
+        'vanilla_perplexity': np.mean([r['vanilla_perplexity'] for r in results]),
+        'dual_accuracy': np.mean([r['dual_accuracy'] for r in results]),
+        'vanilla_accuracy': np.mean([r['vanilla_accuracy'] for r in results]),
+        'dual_matches_vanilla': np.mean([r['dual_matches_vanilla'] for r in results]),
+        'dual_avg_rank': np.mean([r['dual_avg_rank'] for r in results]),
+        'vanilla_avg_rank': np.mean([r['vanilla_avg_rank'] for r in results]),
+        'vanilla_top1_rank_in_dual': np.mean([r['vanilla_top1_rank_in_dual'] for r in results]),
+    }
+    
+    std_metrics = {
+        'dual_perplexity': np.std([r['dual_perplexity'] for r in results]),
+        'vanilla_perplexity': np.std([r['vanilla_perplexity'] for r in results]),
+        'dual_accuracy': np.std([r['dual_accuracy'] for r in results]),
+        'vanilla_accuracy': np.std([r['vanilla_accuracy'] for r in results]),
+        'dual_matches_vanilla': np.std([r['dual_matches_vanilla'] for r in results]),
+        'dual_avg_rank': np.std([r['dual_avg_rank'] for r in results]),
+        'vanilla_avg_rank': np.std([r['vanilla_avg_rank'] for r in results]),
+        'vanilla_top1_rank_in_dual': np.std([r['vanilla_top1_rank_in_dual'] for r in results]),
+    }
+    
+    # Print results
+    print(f"\n{'='*80}")
+    print(f"SINGLE-STREAM EVALUATION RESULTS")
+    print(f"{'='*80}")
+    print(f"Number of evaluated samples: {len(results)}")
+    print(f"\n{'-'*80}")
+    print(f"PERPLEXITY (lower is better):")
+    print(f"  Dual model:    {avg_metrics['dual_perplexity']:.2f} ± {std_metrics['dual_perplexity']:.2f}")
+    print(f"  Vanilla model: {avg_metrics['vanilla_perplexity']:.2f} ± {std_metrics['vanilla_perplexity']:.2f}")
+    print(f"  Ratio (dual/vanilla): {avg_metrics['dual_perplexity']/avg_metrics['vanilla_perplexity']:.3f}")
+    print(f"\n{'-'*80}")
+    print(f"TOKEN ACCURACY (higher is better):")
+    print(f"  Dual model:    {avg_metrics['dual_accuracy']*100:.2f}% ± {std_metrics['dual_accuracy']*100:.2f}%")
+    print(f"  Vanilla model: {avg_metrics['vanilla_accuracy']*100:.2f}% ± {std_metrics['vanilla_accuracy']*100:.2f}%")
+    print(f"\n{'-'*80}")
+    print(f"DUAL-VANILLA AGREEMENT (how often argmax matches):")
+    print(f"  {avg_metrics['dual_matches_vanilla']*100:.2f}% ± {std_metrics['dual_matches_vanilla']*100:.2f}%")
+    print(f"\n{'-'*80}")
+    print(f"TRUE TOKEN RANK (lower is better):")
+    print(f"  Dual model:    {avg_metrics['dual_avg_rank']:.2f} ± {std_metrics['dual_avg_rank']:.2f}")
+    print(f"  Vanilla model: {avg_metrics['vanilla_avg_rank']:.2f} ± {std_metrics['vanilla_avg_rank']:.2f}")
+    print(f"\n{'-'*80}")
+    print(f"VANILLA TOP-1 RANK IN DUAL (lower is better):")
+    print(f"  {avg_metrics['vanilla_top1_rank_in_dual']:.2f} ± {std_metrics['vanilla_top1_rank_in_dual']:.2f}")
+    print(f"{'='*80}\n")
+    
+    return avg_metrics, std_metrics
+
+
 if __name__ == '__main__':
-    fire.Fire(evaluate)
+    fire.Fire({
+        'evaluate': evaluate,
+        'evaluate_single_stream': evaluate_single_stream
+    })
 

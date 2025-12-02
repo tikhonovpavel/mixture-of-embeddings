@@ -5,7 +5,8 @@ import numpy as np
 class DualStreamCollator:
     """Collator for dual-stream training that creates paired batches."""
     
-    def __init__(self, tokenizer, max_length: int = 512, objective: str = 'separate', mixup_alpha: float = 1.0):
+    def __init__(self, tokenizer, max_length: int = 512, objective: str = 'separate', 
+                 mixup_alpha: float = 1.0, same_text_prob: float = 0.0):
         """Initialize collator.
         
         Args:
@@ -13,11 +14,13 @@ class DualStreamCollator:
             max_length: Maximum sequence length
             objective: Training objective ('separate', 'averaged', 'mixup', or 'distillation')
             mixup_alpha: Alpha parameter for Beta distribution in mixup
+            same_text_prob: Probability of using same text for both streams (default 0.0)
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.objective = objective
         self.mixup_alpha = mixup_alpha
+        self.same_text_prob = same_text_prob
         
     def __call__(self, batch):
         """Collate a batch of samples.
@@ -34,6 +37,15 @@ class DualStreamCollator:
         min_len = min(len(texts_A), len(texts_B))
         texts_A = texts_A[:min_len]
         texts_B = texts_B[:min_len]
+        
+        # With probability same_text_prob, use same text for both streams
+        is_same_text = torch.zeros(min_len, dtype=torch.bool)
+        if self.same_text_prob > 0:
+            same_mask = np.random.rand(min_len) < self.same_text_prob
+            is_same_text = torch.from_numpy(same_mask)
+            for i in range(min_len):
+                if same_mask[i]:
+                    texts_B[i] = texts_A[i]
         
         encoded_A = self.tokenizer(
             texts_A,
@@ -75,6 +87,7 @@ class DualStreamCollator:
                 'input_ids_B': encoded_B['input_ids'],
                 'attention_mask_B': encoded_B['attention_mask'],
                 'labels_B': labels_B,
+                'is_same_text': is_same_text,
             }
         
         elif self.objective == 'averaged' or self.objective == 'distillation':
@@ -91,6 +104,7 @@ class DualStreamCollator:
                 'attention_mask_B': encoded_B['attention_mask'],
                 'next_tokens_B': next_tokens_B,
                 'pad_token_id': self.tokenizer.pad_token_id,
+                'is_same_text': is_same_text,
             }
         
         elif self.objective == 'mixup':
@@ -114,6 +128,7 @@ class DualStreamCollator:
                 'next_tokens_B': next_tokens_B,
                 'lambdas': lambdas,  # [batch_size]
                 'pad_token_id': self.tokenizer.pad_token_id,
+                'is_same_text': is_same_text,
             }
         
         else:

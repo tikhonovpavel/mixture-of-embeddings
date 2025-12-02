@@ -107,6 +107,7 @@ class TrainingLogger:
         self.writer.add_scalar('config/seed', config['seed'])
         self.writer.add_scalar('config/world_size', config.get('world_size', 1))
         self.writer.add_scalar('config/mixup_alpha', config['mixup_alpha'])
+        self.writer.add_scalar('config/same_text_prob', config.get('same_text_prob', 0.0))
         self.writer.add_scalar('config/loss_balance_strength', config['loss_balance_strength'])
         self.writer.add_scalar('config/loss_balance_ema_momentum', config['loss_balance_ema_momentum'])
         self.writer.add_scalar('config/loss_balance_warmup_steps', config['loss_balance_warmup_steps'])
@@ -162,7 +163,9 @@ class TrainingLogger:
         backbone_lr: Optional[float] = None,
         grad_norm: Optional[float] = None,
         objective: str = 'separate',
-        use_loss_balancing: bool = False
+        use_loss_balancing: bool = False,
+        loss_same_text: Optional[float] = None,
+        loss_diff_text: Optional[float] = None
     ):
         """Log training metrics to TensorBoard."""
         if self.writer is None:
@@ -176,6 +179,12 @@ class TrainingLogger:
             self.writer.add_scalar('hyperparams/backbone_current_lr', backbone_lr, step)
         if grad_norm is not None:
             self.writer.add_scalar('train/grad_norm', grad_norm, step)
+        
+        # Log same/different text losses
+        if loss_same_text is not None:
+            self.writer.add_scalar('train/loss_same_text', loss_same_text, step)
+        if loss_diff_text is not None:
+            self.writer.add_scalar('train/loss_diff_text', loss_diff_text, step)
         
         if objective == 'separate':
             if loss_A is not None:

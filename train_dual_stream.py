@@ -27,7 +27,7 @@ os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
 def train(
     model_name='HuggingFaceTB/SmolLM2-135M',
-    dataset_name='roneneldan/TinyStories',
+    dataset_name='HuggingFaceFW/fineweb',
     dataset_config=None,
     dataset_split='train',
     device=None,
@@ -60,6 +60,8 @@ def train(
     teacher_model_name=None,  # Teacher model name. If None, uses same as model_name
     teacher_load_in_8bit=True,  # Load teacher in 8-bit quantization mode
     distillation_temperature=2.0,  # Temperature for softening teacher distributions
+    # Same text probability
+    same_text_prob=0.2,  # Probability of using same text for both streams
     # Loss balancing parameters
     loss_balance_strength=5.0,
     loss_balance_ema_momentum=0.99,
@@ -133,7 +135,7 @@ def train(
             max_length, log_interval, similarity_log_interval, eval_interval, save_interval,
             max_gen_tokens, temperature, seed, objective, use_loss_balancing, shared_embeddings,
             embedding_init_strategy, unembedding_init_strategy, embedding_init_noise_std,
-            mixup_alpha, loss_balance_strength, loss_balance_ema_momentum,
+            mixup_alpha, same_text_prob, loss_balance_strength, loss_balance_ema_momentum,
             loss_balance_warmup_steps, loss_balance_clip_min, loss_balance_clip_max,
             lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps,
             teacher_model_name, teacher_load_in_8bit, distillation_temperature
@@ -184,7 +186,8 @@ def train(
         print(f"Dataset shuffle seed for rank {rank}: {dataset_seed}")
     
     # Setup collator and dataloader
-    collate_fn = DualStreamCollator(tokenizer, max_length=max_length, objective=objective, mixup_alpha=mixup_alpha)
+    collate_fn = DualStreamCollator(tokenizer, max_length=max_length, objective=objective, 
+                                    mixup_alpha=mixup_alpha, same_text_prob=same_text_prob)
     dataloader = DataLoader(dataset, batch_size=batch_size * 2, collate_fn=collate_fn)
     
     model = DualStreamLLM(
@@ -403,7 +406,7 @@ def _create_config_dict(
     max_length, log_interval, similarity_log_interval, eval_interval, save_interval,
     max_gen_tokens, temperature, seed, objective, use_loss_balancing, shared_embeddings,
     embedding_init_strategy, unembedding_init_strategy, embedding_init_noise_std,
-    mixup_alpha, loss_balance_strength, loss_balance_ema_momentum,
+    mixup_alpha, same_text_prob, loss_balance_strength, loss_balance_ema_momentum,
     loss_balance_warmup_steps, loss_balance_clip_min, loss_balance_clip_max,
     lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps,
     teacher_model_name, teacher_load_in_8bit, distillation_temperature
@@ -435,6 +438,7 @@ def _create_config_dict(
         'unembedding_init_strategy': unembedding_init_strategy,
         'embedding_init_noise_std': embedding_init_noise_std,
         'mixup_alpha': mixup_alpha,
+        'same_text_prob': same_text_prob,
         'teacher_model_name': teacher_model_name,
         'teacher_load_in_8bit': teacher_load_in_8bit,
         'distillation_temperature': distillation_temperature,

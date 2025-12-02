@@ -232,11 +232,56 @@ class Trainer:
         attention_mask_B = batch['attention_mask_B'].to(self.device)
         labels_A = batch['labels_A'].to(self.device)
         labels_B = batch['labels_B'].to(self.device)
+        is_same_text = batch.get('is_same_text', None)
         
         logits_A, logits_B = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
         
-        loss_A = self.loss_fn(logits_A.view(-1, logits_A.size(-1)), labels_A.view(-1))
-        loss_B = self.loss_fn(logits_B.view(-1, logits_B.size(-1)), labels_B.view(-1))
+        # Compute per-sample losses for separate logging
+        batch_size = input_ids_A.size(0)
+        seq_len = input_ids_A.size(1)
+        vocab_size = logits_A.size(-1)
+        
+        # Reshape for per-sample loss computation
+        loss_A_per_sample = F.cross_entropy(
+            logits_A.view(batch_size * seq_len, vocab_size),
+            labels_A.view(batch_size * seq_len),
+            reduction='none'
+        ).view(batch_size, seq_len)
+        loss_B_per_sample = F.cross_entropy(
+            logits_B.view(batch_size * seq_len, vocab_size),
+            labels_B.view(batch_size * seq_len),
+            reduction='none'
+        ).view(batch_size, seq_len)
+        
+        # Mask out padding (-100)
+        valid_mask_A = (labels_A != -100).float()
+        valid_mask_B = (labels_B != -100).float()
+        
+        # Per-sample mean loss
+        loss_A_sample = (loss_A_per_sample * valid_mask_A).sum(dim=1) / (valid_mask_A.sum(dim=1) + 1e-8)
+        loss_B_sample = (loss_B_per_sample * valid_mask_B).sum(dim=1) / (valid_mask_B.sum(dim=1) + 1e-8)
+        
+        # Total loss (mean over batch)
+        loss_A = loss_A_sample.mean()
+        loss_B = loss_B_sample.mean()
+        
+        # Compute separate losses for same_text and different_text cases
+        loss_same = None
+        loss_diff = None
+        if is_same_text is not None:
+            is_same_text = is_same_text.to(self.device)
+            same_mask = is_same_text.float()
+            diff_mask = (~is_same_text).float()
+            
+            num_same = same_mask.sum()
+            num_diff = diff_mask.sum()
+            
+            total_loss_sample = loss_A_sample + loss_B_sample
+            
+            if num_same > 0:
+                loss_same = (total_loss_sample * same_mask).sum() / num_same
+            if num_diff > 0:
+                loss_diff = (total_loss_sample * diff_mask).sum() / num_diff
         
         # Update EMA for loss balancing
         if self.use_loss_balancing:
@@ -248,7 +293,7 @@ class Trainer:
                 self.ema_loss_A = current_ema_momentum * self.ema_loss_A + (1 - current_ema_momentum) * loss_A.item()
                 self.ema_loss_B = current_ema_momentum * self.ema_loss_B + (1 - current_ema_momentum) * loss_B.item()
         
-        return loss_A, loss_B
+        return loss_A, loss_B, loss_same, loss_diff
     
     def _compute_loss_averaged(self, batch):
         """Compute loss for 'averaged' objective."""
@@ -259,6 +304,7 @@ class Trainer:
         next_tokens_A = batch['next_tokens_A'].to(self.device)
         next_tokens_B = batch['next_tokens_B'].to(self.device)
         pad_token_id = batch['pad_token_id']
+        is_same_text = batch.get('is_same_text', None)
         
         logits = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
         
@@ -276,14 +322,33 @@ class Trainer:
         log_prob_A = torch.gather(log_probs, dim=-1, index=next_tokens_A.unsqueeze(-1)).squeeze(-1)
         log_prob_B = torch.gather(log_probs, dim=-1, index=next_tokens_B.unsqueeze(-1)).squeeze(-1)
         
-        # Average the two cross-entropy losses
-        loss = 0.5 * (-log_prob_A + -log_prob_B)
+        # Per-position loss
+        loss_per_pos = 0.5 * (-log_prob_A + -log_prob_B)
         
-        # Apply mask and compute average
-        loss = loss * valid_mask.float()
-        loss = loss.sum() / (valid_mask.float().sum() + 1e-8)
+        # Per-sample loss
+        valid_mask_float = valid_mask.float()
+        loss_per_sample = (loss_per_pos * valid_mask_float).sum(dim=1) / (valid_mask_float.sum(dim=1) + 1e-8)
         
-        return loss, loss
+        # Total loss
+        loss = loss_per_sample.mean()
+        
+        # Compute separate losses for same_text and different_text cases
+        loss_same = None
+        loss_diff = None
+        if is_same_text is not None:
+            is_same_text = is_same_text.to(self.device)
+            same_mask = is_same_text.float()
+            diff_mask = (~is_same_text).float()
+            
+            num_same = same_mask.sum()
+            num_diff = diff_mask.sum()
+            
+            if num_same > 0:
+                loss_same = (loss_per_sample * same_mask).sum() / num_same
+            if num_diff > 0:
+                loss_diff = (loss_per_sample * diff_mask).sum() / num_diff
+        
+        return loss, loss, loss_same, loss_diff
     
     def _compute_loss_mixup(self, batch):
         """Compute loss for 'mixup' objective."""
@@ -295,6 +360,7 @@ class Trainer:
         next_tokens_B = batch['next_tokens_B'].to(self.device)
         lambdas = batch['lambdas'].to(self.device)
         pad_token_id = batch['pad_token_id']
+        is_same_text = batch.get('is_same_text', None)
         
         logits = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B, lambdas=lambdas)
         
@@ -316,13 +382,32 @@ class Trainer:
         lambdas_expanded = lambdas.view(-1, 1).to(log_prob_A.dtype)
         
         # Mixup loss: -[λ * log(P_A) + (1-λ) * log(P_B)]
-        loss = -(lambdas_expanded * log_prob_A + (1 - lambdas_expanded) * log_prob_B)
+        loss_per_pos = -(lambdas_expanded * log_prob_A + (1 - lambdas_expanded) * log_prob_B)
         
-        # Apply mask and compute average
-        loss = loss * valid_mask.float()
-        loss = loss.sum() / (valid_mask.float().sum() + 1e-8)
+        # Per-sample loss
+        valid_mask_float = valid_mask.float()
+        loss_per_sample = (loss_per_pos * valid_mask_float).sum(dim=1) / (valid_mask_float.sum(dim=1) + 1e-8)
         
-        return loss, loss
+        # Total loss
+        loss = loss_per_sample.mean()
+        
+        # Compute separate losses for same_text and different_text cases
+        loss_same = None
+        loss_diff = None
+        if is_same_text is not None:
+            is_same_text = is_same_text.to(self.device)
+            same_mask = is_same_text.float()
+            diff_mask = (~is_same_text).float()
+            
+            num_same = same_mask.sum()
+            num_diff = diff_mask.sum()
+            
+            if num_same > 0:
+                loss_same = (loss_per_sample * same_mask).sum() / num_same
+            if num_diff > 0:
+                loss_diff = (loss_per_sample * diff_mask).sum() / num_diff
+        
+        return loss, loss, loss_same, loss_diff
     
     def _compute_loss_distillation(self, batch):
         """Compute loss for 'distillation' objective using KL divergence."""
@@ -331,6 +416,7 @@ class Trainer:
         input_ids_B = batch['input_ids_B'].to(self.device)
         attention_mask_B = batch['attention_mask_B'].to(self.device)
         pad_token_id = batch['pad_token_id']
+        is_same_text = batch.get('is_same_text', None)
         
         # Get teacher predictions for both streams separately
         with torch.no_grad():
@@ -367,16 +453,36 @@ class Trainer:
         
         # Compute KL divergence: KL(target || student) = sum(target * log(target/student))
         # = sum(target * (log(target) - log(student)))
-        kl_div = (target_probs * (torch.log(target_probs + 1e-10) - student_log_probs)).sum(dim=-1)
+        kl_div_per_pos = (target_probs * (torch.log(target_probs + 1e-10) - student_log_probs)).sum(dim=-1)
         
-        # Apply mask and compute average
-        kl_div = kl_div * valid_mask.float()
-        loss = kl_div.sum() / (valid_mask.float().sum() + 1e-8)
+        # Per-sample loss
+        valid_mask_float = valid_mask.float()
+        loss_per_sample = (kl_div_per_pos * valid_mask_float).sum(dim=1) / (valid_mask_float.sum(dim=1) + 1e-8)
+        
+        # Total loss
+        loss = loss_per_sample.mean()
         
         # Scale loss by temperature^2 (standard practice in distillation)
         loss = loss * (self.distillation_temperature ** 2)
+        loss_per_sample = loss_per_sample * (self.distillation_temperature ** 2)
         
-        return loss, loss
+        # Compute separate losses for same_text and different_text cases
+        loss_same = None
+        loss_diff = None
+        if is_same_text is not None:
+            is_same_text = is_same_text.to(self.device)
+            same_mask = is_same_text.float()
+            diff_mask = (~is_same_text).float()
+            
+            num_same = same_mask.sum()
+            num_diff = diff_mask.sum()
+            
+            if num_same > 0:
+                loss_same = (loss_per_sample * same_mask).sum() / num_same
+            if num_diff > 0:
+                loss_diff = (loss_per_sample * diff_mask).sum() / num_diff
+        
+        return loss, loss, loss_same, loss_diff
     
     def _update_loss_balancing_coefficients(self, step: int):
         """Update alpha and beta coefficients for loss balancing."""
@@ -514,6 +620,12 @@ class Trainer:
         total_loss_acc_scheduler = 0.0
         scheduler_steps_acc = 0
         
+        # Same/different text loss accumulators
+        loss_same_acc_log = 0.0
+        loss_diff_acc_log = 0.0
+        num_same_batches = 0
+        num_diff_batches = 0
+        
         num_optimizer_steps = self.num_train_steps // self.gradient_accumulation_steps
         
         # Progress bar
@@ -535,19 +647,19 @@ class Trainer:
             
             # Compute loss based on objective
             if self.objective == 'separate':
-                loss_A, loss_B = self._compute_loss_separate(batch)
+                loss_A, loss_B, loss_same, loss_diff = self._compute_loss_separate(batch)
                 self.alpha, self.beta = self._update_loss_balancing_coefficients(step)
                 loss = self.alpha * loss_A + self.beta * loss_B
             elif self.objective == 'averaged':
-                loss, loss_A = self._compute_loss_averaged(batch)
+                loss, loss_A, loss_same, loss_diff = self._compute_loss_averaged(batch)
                 loss_B = loss_A
                 self.alpha, self.beta = 1.0, 1.0
             elif self.objective == 'mixup':
-                loss, loss_A = self._compute_loss_mixup(batch)
+                loss, loss_A, loss_same, loss_diff = self._compute_loss_mixup(batch)
                 loss_B = loss_A
                 self.alpha, self.beta = 1.0, 1.0
             elif self.objective == 'distillation':
-                loss, loss_A = self._compute_loss_distillation(batch)
+                loss, loss_A, loss_same, loss_diff = self._compute_loss_distillation(batch)
                 loss_B = loss_A
                 self.alpha, self.beta = 1.0, 1.0
             
@@ -564,6 +676,14 @@ class Trainer:
             total_loss_acc_log += loss.item()
             loss_A_acc_log += loss_A.item()
             loss_B_acc_log += loss_B.item()
+            
+            # Accumulate same/different text losses
+            if loss_same is not None:
+                loss_same_acc_log += loss_same.item()
+                num_same_batches += 1
+            if loss_diff is not None:
+                loss_diff_acc_log += loss_diff.item()
+                num_diff_batches += 1
             
             # Optimizer step
             if (step + 1) % self.gradient_accumulation_steps == 0:
@@ -587,12 +707,20 @@ class Trainer:
                 
                 # Logging
                 if self.rank == 0 and optimizer_step % self.log_interval == 0:
+                    # Compute average same/diff losses
+                    avg_loss_same = loss_same_acc_log / num_same_batches if num_same_batches > 0 else None
+                    avg_loss_diff = loss_diff_acc_log / num_diff_batches if num_diff_batches > 0 else None
+                    
                     self._log_training_step(optimizer_step, num_optimizer_steps, pbar, 
                                             avg_loss_for_step, loss_A_acc_log, loss_B_acc_log, 
-                                            grad_norm_value)
+                                            grad_norm_value, avg_loss_same, avg_loss_diff)
                     total_loss_acc_log = 0.0
                     loss_A_acc_log = 0.0
                     loss_B_acc_log = 0.0
+                    loss_same_acc_log = 0.0
+                    loss_diff_acc_log = 0.0
+                    num_same_batches = 0
+                    num_diff_batches = 0
                 
                 # Similarity logging
                 if self.rank == 0 and optimizer_step > 0 and optimizer_step % self.similarity_log_interval == 0:
@@ -689,7 +817,7 @@ class Trainer:
     
     def _log_training_step(self, optimizer_step: int, num_optimizer_steps: int, pbar, 
                            avg_total_loss: float, loss_A_acc: float, loss_B_acc: float,
-                           grad_norm_value):
+                           grad_norm_value, avg_loss_same: float = None, avg_loss_diff: float = None):
         """Log training metrics for current step."""
         avg_loss_A = loss_A_acc / self.gradient_accumulation_steps
         avg_loss_B = loss_B_acc / self.gradient_accumulation_steps
@@ -708,6 +836,10 @@ class Trainer:
                 'Alpha': f"{self.alpha:.4f}",
                 'Beta': f"{self.beta:.4f}",
             }
+            if avg_loss_same is not None:
+                postfix_metrics['Same'] = f"{avg_loss_same:.4f}"
+            if avg_loss_diff is not None:
+                postfix_metrics['Diff'] = f"{avg_loss_diff:.4f}"
             if pbar and hasattr(pbar, 'set_postfix'):
                 pbar.set_postfix(postfix_metrics)
         else:
@@ -717,6 +849,10 @@ class Trainer:
                 'LR': f"{current_lr:.2e}",
                 'Backbone LR': f"{current_backbone_lr:.2e}" if current_backbone_lr is not None else 'N/A',
             }
+            if avg_loss_same is not None:
+                postfix_metrics['Same'] = f"{avg_loss_same:.4f}"
+            if avg_loss_diff is not None:
+                postfix_metrics['Diff'] = f"{avg_loss_diff:.4f}"
             if pbar and hasattr(pbar, 'set_postfix'):
                 pbar.set_postfix(postfix_metrics)
         
@@ -732,7 +868,8 @@ class Trainer:
             optimizer_step, avg_total_loss, avg_loss_A, avg_loss_B,
             self.ema_loss_A, self.ema_loss_B, self.alpha, self.beta,
             current_lr, current_backbone_lr, grad_norm_scalar,
-            self.objective, self.use_loss_balancing
+            self.objective, self.use_loss_balancing,
+            avg_loss_same, avg_loss_diff
         )
     
     def _save_checkpoint(self, step: int):
