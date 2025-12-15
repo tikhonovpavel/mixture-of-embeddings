@@ -84,7 +84,7 @@ class DualStreamLLM(nn.Module):
                 _initialize_weights(self.unemb_B, original_lm_head_weights, unembedding_init_strategy, embedding_init_noise_std)
         else: # 'averaged' or 'mixup' objective
             _initialize_weights(self.unemb, original_lm_head_weights, unembedding_init_strategy, embedding_init_noise_std)
-        
+
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
