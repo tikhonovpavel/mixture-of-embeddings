@@ -610,19 +610,31 @@ def evaluate(
 
 def forward_with_embedding_scale(dual_model, input_ids, attention_mask, embedding_scale=1.0):
     """
-    Forward pass through dual model with scaled embeddings.
-    For single-stream mode with embedding scale adjustment.
+    Forward pass through dual model. 
+    Now that the model has dynamic rescaling and stream tags, we just pass the same input to both streams.
+    The embedding_scale parameter is kept for backward compatibility but should usually be 1.0.
     """
-    # Get embeddings
+    # If scale is 1.0 (default), we use the model's forward pass with same inputs
+    # which automatically handles normalization and stream tags correctly.
+    if embedding_scale == 1.0:
+        return dual_model(
+            input_ids_A=input_ids,
+            attention_mask_A=attention_mask,
+            input_ids_B=input_ids,
+            attention_mask_B=attention_mask
+        )
+    
+    # Otherwise, we use the manual logic (only for special testing purposes)
     if dual_model.shared_embeddings:
         embeds = dual_model.emb(input_ids)
     else:
         embeds = dual_model.emb_A(input_ids)
     
-    # Apply scale (for single-stream, use sqrt(2)/2 to match dual-stream norm)
+    # Add stream tag A (matching how the model was trained)
+    embeds = embeds + dual_model.stream_id_A
+    
     scaled_embeds = embeds * embedding_scale
     
-    # Forward through transformer
     transformer_outputs = dual_model.transformer(
         inputs_embeds=scaled_embeds,
         attention_mask=attention_mask,
@@ -632,7 +644,6 @@ def forward_with_embedding_scale(dual_model, input_ids, attention_mask, embeddin
     
     last_hidden_state = transformer_outputs.last_hidden_state
     
-    # Unembedding
     if dual_model.objective == 'separate':
         logits = dual_model.unemb_A(last_hidden_state)
     else:
@@ -656,8 +667,8 @@ def evaluate_single_stream_pair(
     Compare with vanilla model predictions.
     
     Args:
-        embedding_scale: Scale factor for embeddings. Use sqrt(2)/2 ≈ 0.707 
-                        to match expected norm from dual-stream training.
+        embedding_scale: Scale factor for embeddings. Default is 1.0 as the model
+                        now uses Dynamic Rescaling to handle input norms.
     
     Returns:
         Dictionary with metrics
@@ -780,8 +791,8 @@ def evaluate_single_stream(
         num_samples: Number of texts to evaluate
         context_len: Number of context tokens
         eval_len: Number of tokens to evaluate
-        embedding_scale: Scale factor for embeddings. Use sqrt(2)/2 ≈ 0.707
-                        to match expected norm from dual-stream training.
+        embedding_scale: Scale factor for embeddings. Default is 1.0 as the model
+                        now uses Dynamic Rescaling to handle input norms.
         device: Device to use
         seed: Random seed
         num_train_steps: Number of training steps (to skip train data)

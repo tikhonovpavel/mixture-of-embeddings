@@ -44,6 +44,12 @@ class DualStreamLLM(nn.Module):
         else:
             raise ValueError(f"Unknown objective: {objective}")
         
+        # Stream tags to break symmetry
+        self.stream_id_A = nn.Parameter(torch.empty(1, 1, hidden_dim, dtype=torch.bfloat16))
+        self.stream_id_B = nn.Parameter(torch.empty(1, 1, hidden_dim, dtype=torch.bfloat16))
+        nn.init.normal_(self.stream_id_A, mean=0.0, std=0.02)
+        nn.init.normal_(self.stream_id_B, mean=0.0, std=0.02)
+        
         # Initialize weights
         
         def _initialize_weights(target_embedding, base_weights, strategy, noise_std):
@@ -109,15 +115,37 @@ class DualStreamLLM(nn.Module):
             embeds_A = self.emb_A(input_ids_A)
             embeds_B = self.emb_B(input_ids_B)
         
+        # Add stream tags before fusing
+        embeds_A = embeds_A + self.stream_id_A
+        embeds_B = embeds_B + self.stream_id_B
+        
         # Fuse embeddings based on objective
         if self.objective == 'mixup' and lambdas is not None:
             # Mixup: weighted combination based on lambda
             # lambdas shape: [batch_size], need to broadcast to [batch_size, seq_len, hidden_dim]
             lambdas_expanded = lambdas.view(-1, 1, 1).to(embeds_A.dtype).to(embeds_A.device)
             fused_embeds = lambdas_expanded * embeds_A + (1 - lambdas_expanded) * embeds_B
+            # Note: classic mixup also reduces variance, but we keep it standard for now.
         else:
-            # Average fusion for other objectives
-            fused_embeds = (embeds_A + embeds_B) * 0.5
+            # Dynamic Rescaling Strategy: ensure fused embedding has the same norm as inputs
+            # This automatically handles different cases (orthogonal vs collinear)
+            
+            # Compute sum of embeddings
+            sum_embeds = embeds_A + embeds_B
+            
+            # Compute norms along the hidden dimension
+            norm_A = torch.norm(embeds_A, p=2, dim=-1, keepdim=True)
+            norm_B = torch.norm(embeds_B, p=2, dim=-1, keepdim=True)
+            norm_sum = torch.norm(sum_embeds, p=2, dim=-1, keepdim=True)
+            
+            # Target norm is the average of input norms
+            target_norm = (norm_A + norm_B) / 2.0
+            
+            # Compute scale factor with epsilon for numerical stability
+            scale_factor = target_norm / (norm_sum + 1e-6)
+            
+            # Apply dynamic rescaling
+            fused_embeds = sum_embeds * scale_factor
         
         # Use OR operation for attention mask: attend if EITHER stream has valid token
         # This prevents empty attention masks when sequences have different lengths

@@ -78,8 +78,8 @@ class TrainingLogger:
             print("Continuing without copied logs...")
             print('='*80 + '\n')
     
-    def log_training_config(self, config: Dict[str, Any], script_path: Optional[str] = None):
-        """Log training configuration to TensorBoard."""
+    def log_training_config(self, config: Dict[str, Any], project_root: Optional[str] = None):
+        """Log training configuration and code snapshot to TensorBoard."""
         if self.writer is None:
             return
         
@@ -116,15 +116,34 @@ class TrainingLogger:
         self.writer.add_scalar('config/lr_scheduler_patience', config['lr_scheduler_patience'])
         self.writer.add_scalar('config/lr_scheduler_factor', config['lr_scheduler_factor'])
         
-        # Save script version if provided
-        if script_path and os.path.exists(script_path):
-            try:
-                with open(script_path, 'r', encoding='utf-8') as f:
-                    script_content = f.read()
-                self.writer.add_text('script_version/train_dual_stream.py', f"```python\n{script_content}\n```")
-                print(f"Script version saved to tensorboard")
-            except Exception as e:
-                print(f"Warning: Failed to save script version: {e}")
+        # Save code snapshot if project root is provided (using logic from concat.py)
+        if project_root and os.path.exists(project_root):
+            files_to_log = [
+                'train_dual_stream.py', 'model.py', 'trainer.py', 'collator.py',
+                'checkpoint_manager.py', 'config_manager.py', 'logger.py', 
+                'utils.py', 'generation.py', 'evaluate_dual_stream.py'
+            ]
+            
+            combined_code = ""
+            logged_count = 0
+            
+            for filename in files_to_log:
+                filepath = os.path.join(project_root, filename)
+                if os.path.exists(filepath):
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        comment_char = '#' if filename.endswith('.py') else '//'
+                        header = f"{'-' * 40}\n{comment_char} {filename}\n\n"
+                        combined_code += f"{header}{content}\n\n"
+                        logged_count += 1
+                    except Exception as e:
+                        print(f"Warning: Failed to read {filename} for code snapshot: {e}")
+            
+            if combined_code:
+                self.writer.add_text('code_snapshot', f"```python\n{combined_code}\n```")
+                print(f"Code snapshot ({logged_count} files) saved to tensorboard")
         
         self.writer.flush()
     

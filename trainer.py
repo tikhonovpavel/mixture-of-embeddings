@@ -166,7 +166,9 @@ class Trainer:
                     self.model.unemb.parameters()
                 ]
         
-        self.embedding_params = [p for group in trainable_params for p in group]
+        # Add stream tags to trainable parameters
+        stream_params = [self.model.stream_id_A, self.model.stream_id_B]
+        self.embedding_params = [p for group in trainable_params for p in group] + stream_params
         
         if self.freeze_backbone:
             self.optimizer = torch.optim.AdamW(self.embedding_params, lr=self.learning_rate)

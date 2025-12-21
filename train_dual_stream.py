@@ -154,7 +154,7 @@ def train(
     # Setup logger and log configuration
     logger = TrainingLogger(tensorboard_log_dir, rank)
     if rank == 0:
-        logger.log_training_config(config_json, script_path=__file__)
+        logger.log_training_config(config_json, project_root=os.path.dirname(__file__))
         
         # Copy old TensorBoard events if resuming
         if continue_run and old_tensorboard_dir and os.path.exists(old_tensorboard_dir) and resume_step > 0:
@@ -521,6 +521,8 @@ def _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings
             ]
     
     embedding_params = [p for group in trainable_params for p in group]
+    # Add stream tags to parameter count
+    embedding_params.extend([model.stream_id_A, model.stream_id_B])
     
     total_params = sum(p.numel() for p in model.parameters())
     embedding_trainable = sum(p.numel() for p in embedding_params)
