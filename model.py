@@ -44,11 +44,18 @@ class DualStreamLLM(nn.Module):
         else:
             raise ValueError(f"Unknown objective: {objective}")
         
-        # Stream tags to break symmetry
-        self.stream_id_A = nn.Parameter(torch.empty(1, 1, hidden_dim, dtype=torch.bfloat16))
-        self.stream_id_B = nn.Parameter(torch.empty(1, 1, hidden_dim, dtype=torch.bfloat16))
-        nn.init.normal_(self.stream_id_A, mean=0.0, std=0.02)
-        nn.init.normal_(self.stream_id_B, mean=0.0, std=0.02)
+        self.stream_proj_A = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.stream_proj_B = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        
+        # КРИТИЧНО ВАЖНО: Инициализация Identity + шум
+        # Чтобы на старте Input = A + B
+        with torch.no_grad():
+            self.stream_proj_A.weight.copy_(torch.eye(hidden_dim))
+            self.stream_proj_B.weight.copy_(torch.eye(hidden_dim))
+            
+            # Добавляем крошечный шум, чтобы сломать симметрию с первого шага
+            self.stream_proj_A.weight.add_(torch.randn_like(self.stream_proj_A.weight) * 0.001)
+            self.stream_proj_B.weight.add_(torch.randn_like(self.stream_proj_B.weight) * 0.001)
         
         # Initialize weights
         
@@ -96,14 +103,18 @@ class DualStreamLLM(nn.Module):
                 param.requires_grad = False
 
         if hasattr(self.backbone, 'model'):
-            self.transformer = self.backbone.model
+            self._transformer_attr = 'model'
         elif hasattr(self.backbone, 'transformer'):
-            self.transformer = self.backbone.transformer
+            self._transformer_attr = 'transformer'
         elif hasattr(self.backbone, 'gpt_neox'):
-            self.transformer = self.backbone.gpt_neox
+            self._transformer_attr = 'gpt_neox'
         else:
             raise AttributeError("The backbone model does not have a standard transformer attribute ('model', 'transformer', 'gpt_neox').")
         
+    @property
+    def transformer(self):
+        return getattr(self.backbone, self._transformer_attr)
+
     def forward(self, input_ids_A, attention_mask_A, input_ids_B, attention_mask_B, lambdas=None):
         # Get embeddings
         if self.shared_embeddings:
@@ -115,9 +126,9 @@ class DualStreamLLM(nn.Module):
             embeds_A = self.emb_A(input_ids_A)
             embeds_B = self.emb_B(input_ids_B)
         
-        # Add stream tags before fusing
-        embeds_A = embeds_A + self.stream_id_A
-        embeds_B = embeds_B + self.stream_id_B
+        # Apply matrix projections to break symmetry via rotation/transformation
+        embeds_A = self.stream_proj_A(embeds_A)
+        embeds_B = self.stream_proj_B(embeds_B)
         
         # Fuse embeddings based on objective
         if self.objective == 'mixup' and lambdas is not None:

@@ -167,7 +167,8 @@ class Trainer:
                 ]
         
         # Add stream tags to trainable parameters
-        stream_params = [self.model.stream_id_A, self.model.stream_id_B]
+        stream_params = list(self.model.stream_proj_A.parameters()) + \
+                        list(self.model.stream_proj_B.parameters())
         self.embedding_params = [p for group in trainable_params for p in group] + stream_params
         
         if self.freeze_backbone:
@@ -198,7 +199,14 @@ class Trainer:
     def _load_checkpoint(self, checkpoint_data: dict):
         """Load model, optimizer, scheduler, and loss balancing state from checkpoint."""
         print("Loading model state dict...")
-        self.model.load_state_dict(checkpoint_data['model_state_dict'])
+        state_dict = checkpoint_data['model_state_dict']
+        # Filter out duplicate transformer keys if they exist (backward compatibility)
+        keys_to_remove = [k for k in state_dict.keys() if k.startswith('transformer.')]
+        if keys_to_remove:
+            print(f"Removing {len(keys_to_remove)} duplicate 'transformer' keys from checkpoint for backward compatibility.")
+            for k in keys_to_remove:
+                del state_dict[k]
+        self.model.load_state_dict(state_dict)
         print("Loading optimizer state dict...")  
         self.optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint_data:
