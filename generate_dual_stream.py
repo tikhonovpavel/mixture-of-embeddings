@@ -77,7 +77,7 @@ def generate_with_separator(
     print(f"\nLoading separator model: {separator_model_name}")
     separator_model = AutoModelForCausalLM.from_pretrained(
         separator_model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     ).to(device)
     separator_model.eval()
     print("Separator model loaded successfully")

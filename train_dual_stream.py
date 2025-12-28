@@ -58,7 +58,7 @@ def train(
     mixup_alpha=0.4,  # Alpha parameter for Beta distribution in mixup: λ ~ Beta(α, α)
     # Distillation parameters
     teacher_model_name=None,  # Teacher model name. If None, uses same as model_name
-    teacher_load_in_8bit=True,  # Load teacher in 8-bit quantization mode
+    teacher_load_in_8bit=True,
     distillation_temperature=2.0,  # Temperature for softening teacher distributions
     # Same text probability
     same_text_prob=0.2,  # Probability of using same text for both streams
@@ -114,6 +114,15 @@ def train(
         device = torch.device(device)
     else:
         device = torch.device(f'cuda:{local_rank}')
+        
+    # Set specific devices for student and teacher if not distributed and GPUs are available
+    teacher_device = device
+    if world_size == 1 and torch.cuda.device_count() >= 2:
+        device = torch.device('cuda:0')
+        teacher_device = torch.device('cuda:1')
+        print(f"Using separate devices: Student on {device}, Teacher on {teacher_device}")
+    else:
+        print(f"Using device: {device}")
     
     # Enforce shared embeddings for mixup objective
     if objective == 'mixup':
@@ -126,6 +135,11 @@ def train(
         shared_embeddings = True
         if rank == 0:
             print(f"Note: Distillation objective requires shared embeddings. Setting shared_embeddings=True")
+            
+    # Suggest shared embeddings for separate_distillation objective
+    if objective == 'separate_distillation' and not shared_embeddings:
+        if rank == 0:
+            print(f"Note: Separate distillation objective usually benefits from shared embeddings. Consider setting shared_embeddings=True")
     
     # Save full training configuration to JSON
     if rank == 0:
@@ -206,11 +220,11 @@ def train(
     
     # Load teacher model for distillation
     teacher_model = None
-    if objective == 'distillation':
+    if objective == 'distillation' or objective == 'separate_distillation':
         teacher_model = _load_teacher_model(
             teacher_model_name if teacher_model_name else model_name,
             teacher_load_in_8bit,
-            device,
+            teacher_device,
             rank
         )
     
@@ -493,7 +507,7 @@ def _print_training_info(
 
 def _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings):
     """Print parameter counts."""
-    if objective == 'separate':
+    if objective == 'separate' or objective == 'separate_distillation':
         if shared_embeddings:
             trainable_params = [
                 model.emb.parameters(),
@@ -521,8 +535,8 @@ def _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings
             ]
     
     embedding_params = [p for group in trainable_params for p in group]
-    # Add stream tags to parameter count
-    embedding_params.extend([model.stream_id_A, model.stream_id_B])
+    embedding_params.extend(list(model.stream_proj_A.parameters()))
+    embedding_params.extend(list(model.stream_proj_B.parameters()))
     
     total_params = sum(p.numel() for p in model.parameters())
     embedding_trainable = sum(p.numel() for p in embedding_params)

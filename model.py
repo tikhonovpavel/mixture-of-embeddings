@@ -36,7 +36,7 @@ class DualStreamLLM(nn.Module):
             self.emb_B = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
         
         # Unembedding initialization
-        if objective == 'separate':
+        if objective == 'separate' or objective == 'separate_distillation':
             self.unemb_A = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
             self.unemb_B = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
         elif objective == 'averaged' or objective == 'mixup' or objective == 'distillation':
@@ -88,7 +88,7 @@ class DualStreamLLM(nn.Module):
                  _initialize_weights(self.emb_B, original_embed_weights, embedding_init_strategy, embedding_init_noise_std)
         
         # Initialize unembeddings
-        if objective == 'separate':
+        if objective == 'separate' or objective == 'separate_distillation':
             _initialize_weights(self.unemb_A, original_lm_head_weights, unembedding_init_strategy, embedding_init_noise_std)
             # For B, we add noise only if the strategy is 'noisy_copy'.
             if unembedding_init_strategy == 'noisy_copy':
@@ -171,7 +171,7 @@ class DualStreamLLM(nn.Module):
         
         last_hidden_state = transformer_outputs.last_hidden_state
         
-        if self.objective == 'separate':
+        if self.objective == 'separate' or self.objective == 'separate_distillation':
             logits_A = self.unemb_A(last_hidden_state)
             logits_B = self.unemb_B(last_hidden_state)
             return logits_A, logits_B
@@ -180,3 +180,166 @@ class DualStreamLLM(nn.Module):
             return logits
         else:
             raise ValueError(f"Unknown objective: {self.objective}")
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids_A,
+        attention_mask_A,
+        input_ids_B,
+        attention_mask_B,
+        max_new_tokens=50,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        do_sample=True,
+        eos_token_id=None,
+        pad_token_id=None,
+    ):
+        """
+        Autoregressive generation for dual-stream model.
+        
+        Args:
+            input_ids_A: Input token IDs for stream A [batch_size, seq_len]
+            attention_mask_A: Attention mask for stream A [batch_size, seq_len]
+            input_ids_B: Input token IDs for stream B [batch_size, seq_len]
+            attention_mask_B: Attention mask for stream B [batch_size, seq_len]
+            max_new_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature (higher = more random)
+            top_k: Keep only top k tokens with highest probability (None = disabled)
+            top_p: Keep top tokens with cumulative probability >= top_p (None = disabled)
+            do_sample: Whether to sample (True) or use greedy decoding (False)
+            eos_token_id: End of sequence token ID (stops generation)
+            pad_token_id: Padding token ID
+            
+        Returns:
+            If objective == 'separate' or objective == 'separate_distillation':
+                generated_A: Generated tokens for stream A [batch_size, seq_len + max_new_tokens]
+                generated_B: Generated tokens for stream B [batch_size, seq_len + max_new_tokens]
+            Otherwise:
+                generated: Generated tokens [batch_size, seq_len + max_new_tokens]
+        """
+        self.eval()
+        
+        # Clone inputs to avoid modifying original tensors
+        current_ids_A = input_ids_A.clone()
+        current_ids_B = input_ids_B.clone()
+        current_mask_A = attention_mask_A.clone()
+        current_mask_B = attention_mask_B.clone()
+        
+        batch_size = input_ids_A.size(0)
+        device = input_ids_A.device
+        
+        # Track which sequences have finished generating
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for _ in range(max_new_tokens):
+            # Forward pass
+            outputs = self.forward(
+                input_ids_A=current_ids_A,
+                attention_mask_A=current_mask_A,
+                input_ids_B=current_ids_B,
+                attention_mask_B=current_mask_B
+            )
+            
+            if self.objective == 'separate' or self.objective == 'separate_distillation':
+                logits_A, logits_B = outputs
+                # Get logits for last position
+                next_token_logits_A = logits_A[:, -1, :] / temperature
+                next_token_logits_B = logits_B[:, -1, :] / temperature
+            else:
+                logits = outputs
+                next_token_logits = logits[:, -1, :] / temperature
+            
+            # Apply top-k filtering if specified
+            if top_k is not None and top_k > 0:
+                if self.objective == 'separate' or self.objective == 'separate_distillation':
+                    next_token_logits_A = self._top_k_filtering(next_token_logits_A, top_k)
+                    next_token_logits_B = self._top_k_filtering(next_token_logits_B, top_k)
+                else:
+                    next_token_logits = self._top_k_filtering(next_token_logits, top_k)
+            
+            # Apply top-p (nucleus) filtering if specified
+            if top_p is not None and top_p < 1.0:
+                if self.objective == 'separate' or self.objective == 'separate_distillation':
+                    next_token_logits_A = self._top_p_filtering(next_token_logits_A, top_p)
+                    next_token_logits_B = self._top_p_filtering(next_token_logits_B, top_p)
+                else:
+                    next_token_logits = self._top_p_filtering(next_token_logits, top_p)
+            
+            # Sample or greedy decode
+            if do_sample:
+                if self.objective == 'separate' or self.objective == 'separate_distillation':
+                    probs_A = torch.softmax(next_token_logits_A, dim=-1)
+                    probs_B = torch.softmax(next_token_logits_B, dim=-1)
+                    next_token_A = torch.multinomial(probs_A, num_samples=1)
+                    next_token_B = torch.multinomial(probs_B, num_samples=1)
+                else:
+                    probs = torch.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                if self.objective == 'separate' or self.objective == 'separate_distillation':
+                    next_token_A = torch.argmax(next_token_logits_A, dim=-1, keepdim=True)
+                    next_token_B = torch.argmax(next_token_logits_B, dim=-1, keepdim=True)
+                else:
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # Check for EOS tokens
+            if eos_token_id is not None:
+                if self.objective == 'separate' or self.objective == 'separate_distillation':
+                    finished = finished | (next_token_A.squeeze(-1) == eos_token_id) | (next_token_B.squeeze(-1) == eos_token_id)
+                else:
+                    finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            
+            # Replace tokens for finished sequences with pad token
+            if pad_token_id is not None and finished.any():
+                if self.objective == 'separate' or self.objective == 'separate_distillation':
+                    next_token_A[finished] = pad_token_id
+                    next_token_B[finished] = pad_token_id
+                else:
+                    next_token[finished] = pad_token_id
+            
+            # Append new tokens
+            if self.objective == 'separate' or self.objective == 'separate_distillation':
+                current_ids_A = torch.cat([current_ids_A, next_token_A], dim=1)
+                current_ids_B = torch.cat([current_ids_B, next_token_B], dim=1)
+            else:
+                current_ids_A = torch.cat([current_ids_A, next_token], dim=1)
+                current_ids_B = torch.cat([current_ids_B, next_token], dim=1)
+            
+            # Update attention masks
+            current_mask_A = torch.cat([current_mask_A, torch.ones((batch_size, 1), dtype=current_mask_A.dtype, device=device)], dim=1)
+            current_mask_B = torch.cat([current_mask_B, torch.ones((batch_size, 1), dtype=current_mask_B.dtype, device=device)], dim=1)
+            
+            # Stop if all sequences are finished
+            if eos_token_id is not None and finished.all():
+                break
+        
+        if self.objective == 'separate' or self.objective == 'separate_distillation':
+            return current_ids_A, current_ids_B
+        else:
+            return current_ids_A  # For non-separate objectives, both streams share the same output
+    
+    def _top_k_filtering(self, logits, top_k):
+        """Filter a distribution of logits using top-k filtering."""
+        top_k = min(top_k, logits.size(-1))
+        # Remove all tokens with a probability less than the last token of the top-k
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = float('-inf')
+        return logits
+    
+    def _top_p_filtering(self, logits, top_p):
+        """Filter a distribution of logits using nucleus (top-p) filtering."""
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        
+        # Scatter sorted tensors to original indexing
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = float('-inf')
+        return logits

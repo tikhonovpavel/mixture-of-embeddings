@@ -39,7 +39,7 @@ def generate_samples(
             input_ids_B = inputs_B['input_ids']
             attention_mask_B = inputs_B['attention_mask']
             
-            if objective == 'separate':
+            if objective == 'separate' or objective == 'separate_distillation':
                 # For separate objective, generate from both streams simultaneously
                 max_len = max(input_ids_A.size(1), input_ids_B.size(1))
                 if input_ids_A.size(1) < max_len:

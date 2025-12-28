@@ -63,7 +63,7 @@ class DualStreamCollator:
             return_tensors='pt'
         )
         
-        if self.objective == 'separate':
+        if self.objective == 'separate' or self.objective == 'separate_distillation':
             # Shift labels: predict next token, not current
             labels_A = encoded_A['input_ids'].clone()
             labels_B = encoded_B['input_ids'].clone()
@@ -87,6 +87,7 @@ class DualStreamCollator:
                 'input_ids_B': encoded_B['input_ids'],
                 'attention_mask_B': encoded_B['attention_mask'],
                 'labels_B': labels_B,
+                'pad_token_id': self.tokenizer.pad_token_id,
                 'is_same_text': is_same_text,
             }
         

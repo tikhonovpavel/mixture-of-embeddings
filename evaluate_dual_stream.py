@@ -5,13 +5,16 @@ from datasets import load_dataset
 import fire
 import numpy as np
 from tqdm import tqdm
+import os
+import json
 
 from model import DualStreamLLM
 
 
-def load_checkpoint(checkpoint_path, model_name, device):
+def load_checkpoint(checkpoint_path, model_name, device, objective='distillation', shared_embeddings=True):
     """Load trained DualStreamLLM from checkpoint."""
     print(f"Loading checkpoint from: {checkpoint_path}")
+    print(f"Model config: objective={objective}, shared_embeddings={shared_embeddings}")
     
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
@@ -20,15 +23,35 @@ def load_checkpoint(checkpoint_path, model_name, device):
         model_name=model_name,
         freeze_backbone=True,
         embedding_init_strategy='copy',
-        objective='distillation',
-        shared_embeddings=True
+        objective=objective,
+        shared_embeddings=shared_embeddings
     )
     
     # Load state dict
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
+    try:
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        else:
+            model.load_state_dict(checkpoint, strict=True)
+    except RuntimeError as e:
+        # Check if error is due to missing stream_proj keys (backward compatibility for old runs)
+        error_msg = str(e)
+        if 'stream_proj_A.weight' in error_msg and 'stream_proj_B.weight' in error_msg:
+            print("Warning: Checkpoint is missing stream projection weights (old version).")
+            print("Initializing stream projections as STRICT Identity matrices (no noise) for compatibility.")
+            
+            # Force exact Identity (remove the noise added in __init__)
+            with torch.no_grad():
+                model.stream_proj_A.weight.copy_(torch.eye(model.stream_proj_A.weight.shape[0]))
+                model.stream_proj_B.weight.copy_(torch.eye(model.stream_proj_B.weight.shape[0]))
+            
+            # Load with strict=False to ignore missing keys
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+        else:
+            raise e
     
     model = model.to(device)
     model.eval()
@@ -143,16 +166,31 @@ def generate_and_evaluate_pair(
             attention_mask_b = (input_ids_b != tokenizer.pad_token_id).long()
             
             # Get mixed logits from dual model
-            mixed_logits = dual_model(
+            outputs = dual_model(
                 input_ids_A=input_ids_a,
                 attention_mask_A=attention_mask_a,
                 input_ids_B=input_ids_b,
                 attention_mask_B=attention_mask_b
             )
             
-            mixed_logits_next = mixed_logits[:, -1, :]  # [1, vocab_size]
-            
-            if use_separator_model and separator_model is not None:
+            if isinstance(outputs, tuple):
+                # Separate objective: returns (logits_A, logits_B)
+                logits_a, logits_b = outputs
+                
+                logits_a_next = logits_a[:, -1, :]
+                logits_b_next = logits_b[:, -1, :]
+                
+                mixed_logits_next = None 
+                use_separator_model_current = use_separator_model
+            else:
+                mixed_logits = outputs
+                mixed_logits_next = mixed_logits[:, -1, :]  # [1, vocab_size]
+                
+                logits_a_next = mixed_logits_next
+                logits_b_next = mixed_logits_next
+                use_separator_model_current = use_separator_model
+
+            if use_separator_model_current and separator_model is not None:
                 # Use separator model to create masks
                 sep_outputs_a = separator_model(current_context_a)
                 sep_logits_a = sep_outputs_a.logits[:, -1, :]
@@ -162,29 +200,29 @@ def generate_and_evaluate_pair(
                 
                 # Create masks
                 topk_a = torch.topk(sep_logits_a, k=top_k_mask, dim=-1)
-                mask_a = torch.zeros_like(mixed_logits_next)
+                mask_a = torch.zeros_like(logits_a_next)
                 mask_a.scatter_(1, topk_a.indices, 1.0)
                 
                 topk_b = torch.topk(sep_logits_b, k=top_k_mask, dim=-1)
-                mask_b = torch.zeros_like(mixed_logits_next)
+                mask_b = torch.zeros_like(logits_b_next)
                 mask_b.scatter_(1, topk_b.indices, 1.0)
                 
                 # Apply masks
-                filtered_logits_a = mixed_logits_next.clone()
+                filtered_logits_a = logits_a_next.clone()
                 filtered_logits_a[mask_a == 0] = -float('inf')
                 
-                filtered_logits_b = mixed_logits_next.clone()
+                filtered_logits_b = logits_b_next.clone()
                 filtered_logits_b[mask_b == 0] = -float('inf')
             else:
-                # Without separator model: use mixed logits directly
-                filtered_logits_a = mixed_logits_next
-                filtered_logits_b = mixed_logits_next
+                # Without separator model or if mixed_logits_next is not available, use logits directly
+                filtered_logits_a = logits_a_next
+                filtered_logits_b = logits_b_next
             
             # --- Metrics Calculation ---
             
             # 1. Check for filter misses (if separator is used)
-            is_miss_a = use_separator_model and (filtered_logits_a[0, target_token_a].item() == -float('inf'))
-            is_miss_b = use_separator_model and (filtered_logits_b[0, target_token_b].item() == -float('inf'))
+            is_miss_a = use_separator_model_current and (filtered_logits_a[0, target_token_a].item() == -float('inf'))
+            is_miss_b = use_separator_model_current and (filtered_logits_b[0, target_token_b].item() == -float('inf'))
 
             if is_miss_a:
                 misses_a += 1
@@ -229,7 +267,7 @@ def generate_and_evaluate_pair(
                 vanilla_top_token_a = torch.argmax(vanilla_logits_a, dim=-1)
                 
                 # Check if the vanilla target was missed by the filter
-                is_vanilla_miss_a = use_separator_model and (filtered_logits_a[0, vanilla_top_token_a].item() == -float('inf'))
+                is_vanilla_miss_a = use_separator_model_current and (filtered_logits_a[0, vanilla_top_token_a].item() == -float('inf'))
                 if is_vanilla_miss_a:
                     vanilla_misses_a += 1
                 else:
@@ -250,7 +288,7 @@ def generate_and_evaluate_pair(
                 vanilla_logits_b = vanilla_model(current_context_b).logits[:, -1, :]
                 vanilla_top_token_b = torch.argmax(vanilla_logits_b, dim=-1)
                 
-                is_vanilla_miss_b = use_separator_model and (filtered_logits_b[0, vanilla_top_token_b].item() == -float('inf'))
+                is_vanilla_miss_b = use_separator_model_current and (filtered_logits_b[0, vanilla_top_token_b].item() == -float('inf'))
                 if is_vanilla_miss_b:
                     vanilla_misses_b += 1
                 else:
@@ -321,7 +359,11 @@ def evaluate(
     device='cuda',
     seed=42,
     num_train_steps=500_000,
-    train_batch_size=8
+    train_batch_size=8,
+    objective='distillation',
+    shared_embeddings=True,
+    config_path=None,
+    cached_dataset_path=None
 ):
     """
     Evaluate dual-stream generation quality.
@@ -341,7 +383,21 @@ def evaluate(
         seed: Random seed
         num_train_steps: Number of training steps used during training (to skip train data)
         train_batch_size: Batch size used during training (to skip train data)
+        objective: Model objective ('separate', 'distillation', etc.)
+        shared_embeddings: Whether embeddings are shared
+        config_path: Path to training_config.json to load params automatically
+        cached_dataset_path: Path to save/load cached dataset samples
     """
+    import json
+    if config_path:
+        print(f"Loading config from {config_path}")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            objective = config.get('objective', objective)
+            shared_embeddings = config.get('shared_embeddings', shared_embeddings)
+            model_name = config.get('model_name', model_name)
+            # You can override other params here if you want consistency with training config
+            
     torch.manual_seed(seed)
     device = torch.device(device)
     
@@ -352,15 +408,15 @@ def evaluate(
     
     # Load dual-stream model
     if checkpoint_path:
-        dual_model = load_checkpoint(checkpoint_path, model_name, device)
+        dual_model = load_checkpoint(checkpoint_path, model_name, device, objective, shared_embeddings)
     else:
         print("\nNo checkpoint provided. Loading vanilla pre-trained model into DualStreamLLM structure.")
         dual_model = DualStreamLLM(
             model_name=model_name,
             freeze_backbone=True,
             embedding_init_strategy='copy',
-            objective='distillation',
-            shared_embeddings=True
+            objective=objective,
+            shared_embeddings=shared_embeddings
         ).to(device)
         dual_model.eval()
         print("Vanilla model loaded successfully.")
@@ -372,7 +428,7 @@ def evaluate(
         print(f"\nLoading separator model: {separator_model_name}")
         separator_model = AutoModelForCausalLM.from_pretrained(
             separator_model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         ).to(device)
         separator_model.eval()
         print("Separator model loaded successfully")
@@ -383,34 +439,62 @@ def evaluate(
     print(f"\nLoading full vanilla model for comparison: {model_name}")
     vanilla_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     ).to(device)
     vanilla_model.eval()
     print("Full vanilla model loaded successfully")
     
-    # Load dataset
-    print(f"\nLoading dataset: {dataset_name}")
-    if dataset_config:
-        dataset = load_dataset(dataset_name, dataset_config, split='train', streaming=True, trust_remote_code=True)
-    else:
-        dataset = load_dataset(dataset_name, split='train', streaming=True, trust_remote_code=True)
-    
-    # Use same seed as training to get the same data order
-    dataset = dataset.shuffle(seed=seed, buffer_size=10000)
-    
-    # (because we need pairs of texts for dual-stream training)
+    # Load dataset logic with caching
+    dataset_iter = None
     num_train_samples = num_train_steps * train_batch_size * 2
-    
-    # Manually skip samples with progress bar
-    dataset_iter = iter(dataset)
-    print(f"Skipping first {num_train_samples:,} samples (used during training)...")
-    for _ in tqdm(range(num_train_samples), desc="Skipping train samples"):
-        try:
-            next(dataset_iter)
-        except StopIteration:
-            print("Warning: Dataset exhausted before all training samples could be skipped.")
-            break
-    print(f"Skipped {num_train_samples:,} samples. Using subsequent data for evaluation.")
+
+    if cached_dataset_path and os.path.exists(cached_dataset_path):
+        print(f"\nLoading cached dataset from: {cached_dataset_path}")
+        with open(cached_dataset_path, 'r') as f:
+            cached_data = json.load(f)
+        print(f"Loaded {len(cached_data)} samples from cache.")
+        dataset_iter = iter(cached_data)
+    else:
+        print(f"\nLoading dataset: {dataset_name}")
+        if dataset_config:
+            dataset = load_dataset(dataset_name, dataset_config, split='train', streaming=True, trust_remote_code=True)
+        else:
+            dataset = load_dataset(dataset_name, split='train', streaming=True, trust_remote_code=True)
+        
+        # Use same seed as training to get the same data order
+        dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+        
+        # Manually skip samples with progress bar
+        dataset_iter = iter(dataset)
+        print(f"Skipping first {num_train_samples:,} samples (used during training)...")
+        for _ in tqdm(range(num_train_samples), desc="Skipping train samples"):
+            try:
+                next(dataset_iter)
+            except StopIteration:
+                print("Warning: Dataset exhausted before all training samples could be skipped.")
+                break
+        print(f"Skipped {num_train_samples:,} samples. Using subsequent data for evaluation.")
+
+        # Save to cache if requested
+        if cached_dataset_path:
+            print(f"Caching samples to {cached_dataset_path}...")
+            # Collect enough samples for evaluation (with some margin)
+            # We need num_samples * 2 (for pairs) plus some for potential skips due to length
+            samples_to_cache = max(num_samples * 10, 2000)
+            cached_data = []
+            print(f"Collecting {samples_to_cache} samples for cache...")
+            try:
+                for _ in tqdm(range(samples_to_cache), desc="Caching"):
+                    cached_data.append(next(dataset_iter))
+            except StopIteration:
+                print("Dataset exhausted during caching.")
+            
+            with open(cached_dataset_path, 'w') as f:
+                json.dump(cached_data, f)
+            print(f"Saved {len(cached_data)} samples to cache.")
+            
+            # Restart iterator from the cached data so we use exactly what's in the file
+            dataset_iter = iter(cached_data)
     
     print(f"\n{'='*80}")
     print(f"EVALUATION CONFIGURATION")
@@ -617,12 +701,16 @@ def forward_with_embedding_scale(dual_model, input_ids, attention_mask, embeddin
     # If scale is 1.0 (default), we use the model's forward pass with same inputs
     # which automatically handles normalization and stream tags correctly.
     if embedding_scale == 1.0:
-        return dual_model(
+        outputs = dual_model(
             input_ids_A=input_ids,
             attention_mask_A=attention_mask,
             input_ids_B=input_ids,
             attention_mask_B=attention_mask
         )
+        if isinstance(outputs, tuple):
+             # For separate objective, return logits from stream A (arbitrary choice for single stream)
+             return outputs[0]
+        return outputs
     
     # Otherwise, we use the manual logic (only for special testing purposes)
     if dual_model.shared_embeddings:
@@ -777,7 +865,11 @@ def evaluate_single_stream(
     device='cuda',
     seed=42,
     num_train_steps=500_000,
-    train_batch_size=8
+    train_batch_size=8,
+    objective='distillation',
+    shared_embeddings=True,
+    config_path=None,
+    cached_dataset_path=None
 ):
     """
     Evaluate dual-stream model in single-stream mode (no mixing).
@@ -797,7 +889,20 @@ def evaluate_single_stream(
         seed: Random seed
         num_train_steps: Number of training steps (to skip train data)
         train_batch_size: Batch size used during training
+        objective: Model objective
+        shared_embeddings: Whether embeddings are shared
+        config_path: Path to config file
+        cached_dataset_path: Path to save/load cached dataset samples
     """
+    import json
+    if config_path:
+        print(f"Loading config from {config_path}")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            objective = config.get('objective', objective)
+            shared_embeddings = config.get('shared_embeddings', shared_embeddings)
+            model_name = config.get('model_name', model_name)
+
     torch.manual_seed(seed)
     device = torch.device(device)
     
@@ -808,15 +913,15 @@ def evaluate_single_stream(
     
     # Load dual-stream model
     if checkpoint_path:
-        dual_model = load_checkpoint(checkpoint_path, model_name, device)
+        dual_model = load_checkpoint(checkpoint_path, model_name, device, objective, shared_embeddings)
     else:
         print("\nNo checkpoint provided. Loading vanilla pre-trained model into DualStreamLLM structure.")
         dual_model = DualStreamLLM(
             model_name=model_name,
             freeze_backbone=True,
             embedding_init_strategy='copy',
-            objective='distillation',
-            shared_embeddings=True
+            objective=objective,
+            shared_embeddings=shared_embeddings
         ).to(device)
         dual_model.eval()
         print("Vanilla model loaded successfully.")
@@ -825,30 +930,59 @@ def evaluate_single_stream(
     print(f"\nLoading vanilla model for comparison: {model_name}")
     vanilla_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     ).to(device)
     vanilla_model.eval()
     print("Vanilla model loaded successfully")
     
-    # Load dataset
-    print(f"\nLoading dataset: {dataset_name}")
-    if dataset_config:
-        dataset = load_dataset(dataset_name, dataset_config, split='train', streaming=True, trust_remote_code=True)
-    else:
-        dataset = load_dataset(dataset_name, split='train', streaming=True, trust_remote_code=True)
-    
-    dataset = dataset.shuffle(seed=seed, buffer_size=10000)
-    
-    # Skip training samples
+    # Load dataset logic with caching
+    dataset_iter = None
     num_train_samples = num_train_steps * train_batch_size * 2
-    dataset_iter = iter(dataset)
-    print(f"Skipping first {num_train_samples:,} samples (used during training)...")
-    for _ in tqdm(range(num_train_samples), desc="Skipping train samples"):
-        try:
-            next(dataset_iter)
-        except StopIteration:
-            print("Warning: Dataset exhausted before all training samples could be skipped.")
-            break
+
+    if cached_dataset_path and os.path.exists(cached_dataset_path):
+        print(f"\nLoading cached dataset from: {cached_dataset_path}")
+        with open(cached_dataset_path, 'r') as f:
+            cached_data = json.load(f)
+        print(f"Loaded {len(cached_data)} samples from cache.")
+        dataset_iter = iter(cached_data)
+    else:
+        # Load dataset
+        print(f"\nLoading dataset: {dataset_name}")
+        if dataset_config:
+            dataset = load_dataset(dataset_name, dataset_config, split='train', streaming=True, trust_remote_code=True)
+        else:
+            dataset = load_dataset(dataset_name, split='train', streaming=True, trust_remote_code=True)
+        
+        dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+        
+        # Skip training samples
+        dataset_iter = iter(dataset)
+        print(f"Skipping first {num_train_samples:,} samples (used during training)...")
+        for _ in tqdm(range(num_train_samples), desc="Skipping train samples"):
+            try:
+                next(dataset_iter)
+            except StopIteration:
+                print("Warning: Dataset exhausted before all training samples could be skipped.")
+                break
+        
+        # Save to cache if requested
+        if cached_dataset_path:
+            print(f"Caching samples to {cached_dataset_path}...")
+            # Collect enough samples for evaluation
+            samples_to_cache = max(num_samples * 5, 1000)
+            cached_data = []
+            print(f"Collecting {samples_to_cache} samples for cache...")
+            try:
+                for _ in tqdm(range(samples_to_cache), desc="Caching"):
+                    cached_data.append(next(dataset_iter))
+            except StopIteration:
+                print("Dataset exhausted during caching.")
+            
+            with open(cached_dataset_path, 'w') as f:
+                json.dump(cached_data, f)
+            print(f"Saved {len(cached_data)} samples to cache.")
+            
+            dataset_iter = iter(cached_data)
     
     print(f"\n{'='*80}")
     print(f"SINGLE-STREAM EVALUATION (no mixing)")

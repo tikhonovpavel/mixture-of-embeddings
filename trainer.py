@@ -139,7 +139,7 @@ class Trainer:
     
     def _setup_optimizer(self):
         """Setup optimizer with parameter groups."""
-        if self.objective == 'separate':
+        if self.objective == 'separate' or self.objective == 'separate_distillation':
             if self.shared_embeddings:
                 trainable_params = [
                     self.model.emb.parameters(),
@@ -419,6 +419,106 @@ class Trainer:
         
         return loss, loss, loss_same, loss_diff
     
+    def _compute_loss_separate_distillation(self, batch):
+        """Compute loss for 'separate_distillation' objective."""
+        input_ids_A = batch['input_ids_A'].to(self.device)
+        attention_mask_A = batch['attention_mask_A'].to(self.device)
+        input_ids_B = batch['input_ids_B'].to(self.device)
+        attention_mask_B = batch['attention_mask_B'].to(self.device)
+        pad_token_id = batch['pad_token_id']
+        is_same_text = batch.get('is_same_text', None)
+        
+        # Determine teacher device
+        teacher_device = self.teacher_model.device
+        
+        # Get teacher predictions for both streams separately
+        with torch.no_grad():
+            # Teacher predictions for stream A
+            # Move inputs to teacher device
+            input_ids_A_teacher = input_ids_A.to(teacher_device)
+            attention_mask_A_teacher = attention_mask_A.to(teacher_device)
+            
+            teacher_outputs_A = self.teacher_model(
+                input_ids=input_ids_A_teacher,
+                attention_mask=attention_mask_A_teacher,
+            )
+            teacher_logits_A = teacher_outputs_A.logits[:, :-1, :].float()
+            
+            # Teacher predictions for stream B
+            input_ids_B_teacher = input_ids_B.to(teacher_device)
+            attention_mask_B_teacher = attention_mask_B.to(teacher_device)
+            
+            teacher_outputs_B = self.teacher_model(
+                input_ids=input_ids_B_teacher,
+                attention_mask=attention_mask_B_teacher,
+            )
+            teacher_logits_B = teacher_outputs_B.logits[:, :-1, :].float()
+            
+            # Apply temperature and compute soft targets
+            teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
+            teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+            
+            # Move teacher probabilities back to student device for loss computation
+            teacher_probs_A = teacher_probs_A.to(self.device)
+            teacher_probs_B = teacher_probs_B.to(self.device)
+        
+        # Get student predictions (tuple for separate_distillation)
+        logits_A, logits_B = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
+        
+        # Shift logits to match teacher
+        logits_A = logits_A[:, :-1, :].float()
+        logits_B = logits_B[:, :-1, :].float()
+        
+        # Apply temperature to student logits
+        student_log_probs_A = F.log_softmax(logits_A / self.distillation_temperature, dim=-1)
+        student_log_probs_B = F.log_softmax(logits_B / self.distillation_temperature, dim=-1)
+        
+        # Create mask for valid (non-padding) positions
+        valid_mask_A = (input_ids_A[:, 1:] != pad_token_id)
+        valid_mask_B = (input_ids_B[:, 1:] != pad_token_id)
+        
+        # KL Divergence
+        kl_div_A_per_pos = (teacher_probs_A * (torch.log(teacher_probs_A + 1e-10) - student_log_probs_A)).sum(dim=-1)
+        kl_div_B_per_pos = (teacher_probs_B * (torch.log(teacher_probs_B + 1e-10) - student_log_probs_B)).sum(dim=-1)
+        
+        # Per-sample loss
+        valid_mask_A_float = valid_mask_A.float()
+        valid_mask_B_float = valid_mask_B.float()
+        
+        loss_A_sample = (kl_div_A_per_pos * valid_mask_A_float).sum(dim=1) / (valid_mask_A_float.sum(dim=1) + 1e-8)
+        loss_B_sample = (kl_div_B_per_pos * valid_mask_B_float).sum(dim=1) / (valid_mask_B_float.sum(dim=1) + 1e-8)
+        
+        # Total loss
+        loss_A = loss_A_sample.mean()
+        loss_B = loss_B_sample.mean()
+        
+        # Scale by temperature^2
+        loss_A = loss_A * (self.distillation_temperature ** 2)
+        loss_B = loss_B * (self.distillation_temperature ** 2)
+        
+        # Loss same/diff logic
+        loss_same = None
+        loss_diff = None
+        if is_same_text is not None:
+            is_same_text = is_same_text.to(self.device)
+            same_mask = is_same_text.float()
+            diff_mask = (~is_same_text).float()
+            
+            num_same = same_mask.sum()
+            num_diff = diff_mask.sum()
+            
+            # Using scaled sample losses
+            loss_A_sample_scaled = loss_A_sample * (self.distillation_temperature ** 2)
+            loss_B_sample_scaled = loss_B_sample * (self.distillation_temperature ** 2)
+            total_loss_sample = loss_A_sample_scaled + loss_B_sample_scaled
+            
+            if num_same > 0:
+                loss_same = (total_loss_sample * same_mask).sum() / num_same
+            if num_diff > 0:
+                loss_diff = (total_loss_sample * diff_mask).sum() / num_diff
+        
+        return loss_A, loss_B, loss_same, loss_diff
+
     def _compute_loss_distillation(self, batch):
         """Compute loss for 'distillation' objective using KL divergence."""
         input_ids_A = batch['input_ids_A'].to(self.device)
@@ -428,19 +528,28 @@ class Trainer:
         pad_token_id = batch['pad_token_id']
         is_same_text = batch.get('is_same_text', None)
         
+        # Determine teacher device
+        teacher_device = self.teacher_model.device
+        
         # Get teacher predictions for both streams separately
         with torch.no_grad():
             # Teacher predictions for stream A
+            input_ids_A_teacher = input_ids_A.to(teacher_device)
+            attention_mask_A_teacher = attention_mask_A.to(teacher_device)
+            
             teacher_outputs_A = self.teacher_model(
-                input_ids=input_ids_A,
-                attention_mask=attention_mask_A,
+                input_ids=input_ids_A_teacher,
+                attention_mask=attention_mask_A_teacher,
             )
             teacher_logits_A = teacher_outputs_A.logits[:, :-1, :].float()
             
             # Teacher predictions for stream B
+            input_ids_B_teacher = input_ids_B.to(teacher_device)
+            attention_mask_B_teacher = attention_mask_B.to(teacher_device)
+            
             teacher_outputs_B = self.teacher_model(
-                input_ids=input_ids_B,
-                attention_mask=attention_mask_B,
+                input_ids=input_ids_B_teacher,
+                attention_mask=attention_mask_B_teacher,
             )
             teacher_logits_B = teacher_outputs_B.logits[:, :-1, :].float()
             
@@ -450,6 +559,9 @@ class Trainer:
             
             # Average the teacher distributions: P_target = 0.5 * P_A + 0.5 * P_B
             target_probs = 0.5 * teacher_probs_A + 0.5 * teacher_probs_B
+            
+            # Move target probs back to student device
+            target_probs = target_probs.to(self.device)
         
         # Get student predictions on mixed embeddings
         student_logits = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
@@ -552,7 +664,7 @@ class Trainer:
     
     def _log_similarity_metrics(self, optimizer_step: int):
         """Log embedding similarity metrics."""
-        if self.rank != 0 or self.objective != 'separate' or self.shared_embeddings:
+        if self.rank != 0 or (self.objective != 'separate' and self.objective != 'separate_distillation') or self.shared_embeddings:
             return
         
         with torch.no_grad():
@@ -668,6 +780,10 @@ class Trainer:
                 loss, loss_A, loss_same, loss_diff = self._compute_loss_mixup(batch)
                 loss_B = loss_A
                 self.alpha, self.beta = 1.0, 1.0
+            elif self.objective == 'separate_distillation':
+                loss_A, loss_B, loss_same, loss_diff = self._compute_loss_separate_distillation(batch)
+                self.alpha, self.beta = 1.0, 1.0
+                loss = self.alpha * loss_A + self.beta * loss_B
             elif self.objective == 'distillation':
                 loss, loss_A, loss_same, loss_diff = self._compute_loss_distillation(batch)
                 loss_B = loss_A
@@ -835,7 +951,7 @@ class Trainer:
         current_backbone_lr = self.optimizer.param_groups[1]['lr'] if len(self.optimizer.param_groups) > 1 else None
         
         # Update progress bar
-        if self.objective == 'separate':
+        if self.objective == 'separate' or self.objective == 'separate_distillation':
             postfix_metrics = {
                 'Opt Step': f"{optimizer_step}/{num_optimizer_steps}",
                 'Loss': f"{avg_total_loss:.4f}",
