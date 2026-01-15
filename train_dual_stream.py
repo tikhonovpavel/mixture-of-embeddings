@@ -24,25 +24,26 @@ from utils import set_seed, setup_distributed, cleanup_distributed
 
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
-
 def train(
     model_name='HuggingFaceTB/SmolLM2-135M',
     dataset_name='HuggingFaceFW/fineweb',
     dataset_config=None,
     dataset_split='train',
     device=None,
-    batch_size=8,
+    batch_size=16,
     learning_rate=1e-3,
     backbone_lr=1e-4,
     freeze_backbone=False,
-    num_train_steps=200_000,
-    max_length=1024,
+    freeze_embeddings=False,
+    optimize_memory=False,
+    num_train_steps=1_000_000,
+    max_length=128,
     log_interval=1,
     similarity_log_interval=50,
     eval_interval=500,
     save_interval=20_000,
     max_gen_tokens=50,
-    temperature=0.7,
+    temperature=0.95,
     seed=42,
     output_dir='./checkpoints',
     tensorboard_log_dir='./tensorboard_logs',
@@ -145,8 +146,8 @@ def train(
     if rank == 0:
         config_json = _create_config_dict(
             model_name, dataset_name, dataset_config, dataset_split, device,
-            batch_size, learning_rate, backbone_lr, freeze_backbone, num_train_steps,
-            max_length, log_interval, similarity_log_interval, eval_interval, save_interval,
+            batch_size, learning_rate, backbone_lr, freeze_backbone, freeze_embeddings, optimize_memory,
+            num_train_steps, max_length, log_interval, similarity_log_interval, eval_interval, save_interval,
             max_gen_tokens, temperature, seed, objective, use_loss_balancing, shared_embeddings,
             embedding_init_strategy, unembedding_init_strategy, embedding_init_noise_std,
             mixup_alpha, same_text_prob, loss_balance_strength, loss_balance_ema_momentum,
@@ -163,7 +164,7 @@ def train(
         _print_training_info(rank, world_size, device, model_name, dataset_name, dataset_config,
                              objective, use_loss_balancing, shared_embeddings, batch_size,
                              gradient_accumulation_steps, learning_rate, backbone_lr, freeze_backbone,
-                             num_train_steps, seed, output_dir)
+                             freeze_embeddings, optimize_memory, num_train_steps, seed, output_dir)
     
     # Setup logger and log configuration
     logger = TrainingLogger(tensorboard_log_dir, rank)
@@ -207,6 +208,8 @@ def train(
     model = DualStreamLLM(
         model_name=model_name,
         freeze_backbone=freeze_backbone,
+        freeze_embeddings=freeze_embeddings,
+        optimize_memory=optimize_memory,
         embedding_init_strategy=embedding_init_strategy,
         unembedding_init_strategy=unembedding_init_strategy,
         embedding_init_noise_std=embedding_init_noise_std,
@@ -299,7 +302,6 @@ def train(
             print(f"Tensorboard logs saved to: {tensorboard_log_dir}")
     
     cleanup_distributed()
-
 
 def _handle_continue_run(
     continue_run, resume_from_checkpoint, tensorboard_log_dir,
@@ -413,11 +415,10 @@ def _load_teacher_model(model_name: str, load_in_8bit: bool, device, rank: int):
     
     return teacher
 
-
 def _create_config_dict(
     model_name, dataset_name, dataset_config, dataset_split, device,
-    batch_size, learning_rate, backbone_lr, freeze_backbone, num_train_steps,
-    max_length, log_interval, similarity_log_interval, eval_interval, save_interval,
+    batch_size, learning_rate, backbone_lr, freeze_backbone, freeze_embeddings, optimize_memory,
+    num_train_steps, max_length, log_interval, similarity_log_interval, eval_interval, save_interval,
     max_gen_tokens, temperature, seed, objective, use_loss_balancing, shared_embeddings,
     embedding_init_strategy, unembedding_init_strategy, embedding_init_noise_std,
     mixup_alpha, same_text_prob, loss_balance_strength, loss_balance_ema_momentum,
@@ -436,6 +437,8 @@ def _create_config_dict(
         'learning_rate': learning_rate,
         'backbone_lr': backbone_lr,
         'freeze_backbone': freeze_backbone,
+        'freeze_embeddings': freeze_embeddings,
+        'optimize_memory': optimize_memory,
         'num_train_steps': num_train_steps,
         'max_length': max_length,
         'log_interval': log_interval,
@@ -467,11 +470,11 @@ def _create_config_dict(
         'world_size': 1  # Will be updated by trainer
     }
 
-
 def _print_training_info(
     rank, world_size, device, model_name, dataset_name, dataset_config,
     objective, use_loss_balancing, shared_embeddings, batch_size,
     gradient_accumulation_steps, learning_rate, backbone_lr, freeze_backbone,
+    freeze_embeddings, optimize_memory,
     num_train_steps, seed, output_dir
 ):
     """Print training information."""
@@ -489,6 +492,7 @@ def _print_training_info(
     print(f"Objective: {objective}")
     print(f"Use loss balancing: {use_loss_balancing}")
     print(f"Shared embeddings: {shared_embeddings}")
+    print(f"Optimize memory: {optimize_memory}")
     print(f"Batch size per GPU: {batch_size}")
     print(f"Effective global batch size: {batch_size * world_size * gradient_accumulation_steps}")
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
@@ -498,6 +502,7 @@ def _print_training_info(
     print(f"Learning rate (embeddings): {learning_rate}")
     print(f"Learning rate (backbone): {backbone_lr if not freeze_backbone else 'N/A (frozen)'}")
     print(f"Freeze backbone: {freeze_backbone}")
+    print(f"Freeze embeddings: {freeze_embeddings}")
     print(f"Number of training steps: {num_train_steps}")
     print(f"Base seed: {seed}")
     print(f"Dataset seeds: rank_0={seed}, rank_1={seed+1}, ..." if world_size > 1 else f"Dataset seed: {seed}")
@@ -507,50 +512,39 @@ def _print_training_info(
 
 def _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings):
     """Print parameter counts."""
-    if objective == 'separate' or objective == 'separate_distillation':
-        if shared_embeddings:
-            trainable_params = [
-                model.emb.parameters(),
-                model.unemb_A.parameters(),
-                model.unemb_B.parameters()
-            ]
-        else:
-            trainable_params = [
-                model.emb_A.parameters(),
-                model.emb_B.parameters(),
-                model.unemb_A.parameters(),
-                model.unemb_B.parameters()
-            ]
-    else:  # averaged, mixup, or distillation
-        if shared_embeddings:
-            trainable_params = [
-                model.emb.parameters(),
-                model.unemb.parameters()
-            ]
-        else:
-            trainable_params = [
-                model.emb_A.parameters(),
-                model.emb_B.parameters(),
-                model.unemb.parameters()
-            ]
+    # Use a dict with param IDs to handle shared parameters (deduplication)
+    # This ensures we don't double-count memory when optimize_memory=True
+    unique_params = {id(p): p for p in model.parameters()}
+    total_params = sum(p.numel() for p in unique_params.values())
     
-    embedding_params = [p for group in trainable_params for p in group]
-    embedding_params.extend(list(model.stream_proj_A.parameters()))
-    embedding_params.extend(list(model.stream_proj_B.parameters()))
+    # Calculate total trainable params
+    unique_trainable = {id(p): p for p in unique_params.values() if p.requires_grad}
+    total_trainable = sum(p.numel() for p in unique_trainable.values())
     
-    total_params = sum(p.numel() for p in model.parameters())
-    embedding_trainable = sum(p.numel() for p in embedding_params)
+    # Categorize trainable parameters by checking their module names
+    backbone_trainable = 0
+    embedding_related_trainable = 0
+    
+    # Track processed IDs to avoid double counting during categorization
+    processed_ids = set()
+    
+    for name, p in model.named_parameters():
+        if p.requires_grad and id(p) not in processed_ids:
+            processed_ids.add(id(p))
+            if name.startswith('backbone'):
+                backbone_trainable += p.numel()
+            else:
+                # Includes emb (if separate), unemb, stream_proj
+                embedding_related_trainable += p.numel()
+
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {total_trainable:,} ({100*total_trainable/total_params:.2f}%)")
+    print(f"  - Embeddings/Heads/Projections: {embedding_related_trainable:,} ({100*embedding_related_trainable/total_params:.2f}%)")
     
     if not freeze_backbone:
-        backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
-        total_trainable = embedding_trainable + backbone_trainable
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {total_trainable:,} ({100*total_trainable/total_params:.2f}%)")
-        print(f"  - Embeddings/Unembeddings: {embedding_trainable:,} ({100*embedding_trainable/total_params:.2f}%)")
         print(f"  - Backbone: {backbone_trainable:,} ({100*backbone_trainable/total_params:.2f}%)")
     else:
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {embedding_trainable:,} ({100*embedding_trainable/total_params:.2f}%)")
+        print(f"  - Backbone: 0 (0.00%) [Frozen]")
 
 
 if __name__ == '__main__':

@@ -9,7 +9,7 @@ def generate_samples(
     prompts: List[Tuple[str, str]],
     device,
     max_new_tokens: int = 50,
-    temperature: float = 0.7,
+    temperature: float = 0.95,
     objective: str = 'separate'
 ) -> List[Dict[str, str]]:
     """Generate text samples from the model.
@@ -41,15 +41,16 @@ def generate_samples(
             
             if objective == 'separate' or objective == 'separate_distillation':
                 # For separate objective, generate from both streams simultaneously
+                # Use left padding for generation (pad tokens go to the left)
                 max_len = max(input_ids_A.size(1), input_ids_B.size(1))
                 if input_ids_A.size(1) < max_len:
                     pad_len = max_len - input_ids_A.size(1)
-                    input_ids_A = torch.cat([input_ids_A, torch.full((1, pad_len), tokenizer.pad_token_id, device=device)], dim=1)
-                    attention_mask_A = torch.cat([attention_mask_A, torch.zeros((1, pad_len), device=device)], dim=1)
+                    input_ids_A = torch.cat([torch.full((1, pad_len), tokenizer.pad_token_id, device=device), input_ids_A], dim=1)
+                    attention_mask_A = torch.cat([torch.zeros((1, pad_len), device=device), attention_mask_A], dim=1)
                 if input_ids_B.size(1) < max_len:
                     pad_len = max_len - input_ids_B.size(1)
-                    input_ids_B = torch.cat([input_ids_B, torch.full((1, pad_len), tokenizer.pad_token_id, device=device)], dim=1)
-                    attention_mask_B = torch.cat([attention_mask_B, torch.zeros((1, pad_len), device=device)], dim=1)
+                    input_ids_B = torch.cat([torch.full((1, pad_len), tokenizer.pad_token_id, device=device), input_ids_B], dim=1)
+                    attention_mask_B = torch.cat([torch.zeros((1, pad_len), device=device), attention_mask_B], dim=1)
                 
                 for _ in range(max_new_tokens):
                     logits_A, logits_B = model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)

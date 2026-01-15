@@ -430,49 +430,39 @@ def _print_training_info(
 
 def _print_parameter_counts(model, freeze_backbone, objective, shared_embeddings):
     """Print parameter counts."""
-    if objective == 'separate':
-        if shared_embeddings:
-            trainable_params = [
-                model.emb.parameters(),
-                model.unemb_A.parameters(),
-                model.unemb_B.parameters()
-            ]
-        else:
-            trainable_params = [
-                model.emb_A.parameters(),
-                model.emb_B.parameters(),
-                model.unemb_A.parameters(),
-                model.unemb_B.parameters()
-            ]
-    else:  # averaged or mixup
-        if shared_embeddings:
-            trainable_params = [
-                model.emb.parameters(),
-                model.unemb.parameters()
-            ]
-        else:
-            trainable_params = [
-                model.emb_A.parameters(),
-                model.emb_B.parameters(),
-                model.unemb.parameters()
-            ]
+    # Use a dict with param IDs to handle shared parameters (deduplication)
+    # This ensures we don't double-count memory when optimize_memory=True
+    unique_params = {id(p): p for p in model.parameters()}
+    total_params = sum(p.numel() for p in unique_params.values())
     
-    embedding_params = [p for group in trainable_params for p in group]
+    # Calculate total trainable params
+    unique_trainable = {id(p): p for p in unique_params.values() if p.requires_grad}
+    total_trainable = sum(p.numel() for p in unique_trainable.values())
     
-    total_params = sum(p.numel() for p in model.parameters())
-    embedding_trainable = sum(p.numel() for p in embedding_params)
+    # Categorize trainable parameters by checking their module names
+    backbone_trainable = 0
+    embedding_related_trainable = 0
+    
+    # Track processed IDs to avoid double counting during categorization
+    processed_ids = set()
+    
+    for name, p in model.named_parameters():
+        if p.requires_grad and id(p) not in processed_ids:
+            processed_ids.add(id(p))
+            if name.startswith('backbone'):
+                backbone_trainable += p.numel()
+            else:
+                # Includes emb (if separate), unemb, stream_proj
+                embedding_related_trainable += p.numel()
+
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {total_trainable:,} ({100*total_trainable/total_params:.2f}%)")
+    print(f"  - Embeddings/Heads/Projections: {embedding_related_trainable:,} ({100*embedding_related_trainable/total_params:.2f}%)")
     
     if not freeze_backbone:
-        backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
-        total_trainable = embedding_trainable + backbone_trainable
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {total_trainable:,} ({100*total_trainable/total_params:.2f}%)")
-        print(f"  - Embeddings/Unembeddings: {embedding_trainable:,} ({100*embedding_trainable/total_params:.2f}%)")
         print(f"  - Backbone: {backbone_trainable:,} ({100*backbone_trainable/total_params:.2f}%)")
     else:
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {embedding_trainable:,} ({100*embedding_trainable/total_params:.2f}%)")
-
+        print(f"  - Backbone: 0 (0.00%) [Frozen]")
 
 if __name__ == '__main__':
     fire.Fire(train)

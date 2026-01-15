@@ -3,9 +3,9 @@ import torch.nn as nn
 
 from transformers import AutoModelForCausalLM, AutoConfig
 
-
 class DualStreamLLM(nn.Module):
     def __init__(self, model_name, freeze_backbone=True,
+                 freeze_embeddings=False, optimize_memory=False,
                  embedding_init_strategy='random', embedding_init_noise_std=0.01,
                  unembedding_init_strategy=None,
                  objective='separate', shared_embeddings=False):
@@ -28,8 +28,12 @@ class DualStreamLLM(nn.Module):
         
         # Embedding initialization
         if shared_embeddings:
-            # Single shared embedding matrix for both streams
-            self.emb = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
+            if optimize_memory:
+                # Use the backbone's embedding matrix directly to save memory
+                self.emb = self.backbone.get_input_embeddings()
+            else:
+                # Create a new shared embedding matrix for both streams
+                self.emb = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
         else:
             # Separate embedding matrices
             self.emb_A = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
@@ -77,6 +81,8 @@ class DualStreamLLM(nn.Module):
             original_lm_head_weights = original_embed_weights
 
         # Initialize embeddings
+        # Note: If optimize_memory is True for shared_embeddings, self.emb IS the backbone embedding.
+        # Initializing it will modify the backbone. This is generally expected behavior unless frozen.
         if shared_embeddings:
             _initialize_weights(self.emb, original_embed_weights, embedding_init_strategy, embedding_init_noise_std)
         else:
@@ -97,6 +103,23 @@ class DualStreamLLM(nn.Module):
                 _initialize_weights(self.unemb_B, original_lm_head_weights, unembedding_init_strategy, embedding_init_noise_std)
         else: # 'averaged' or 'mixup' objective
             _initialize_weights(self.unemb, original_lm_head_weights, unembedding_init_strategy, embedding_init_noise_std)
+
+        # Freeze/Optimize Memory Cleanup
+        
+        # Apply explicit embedding freeze if requested
+        if freeze_embeddings:
+            if shared_embeddings:
+                self.emb.weight.requires_grad = False
+            else:
+                self.emb_A.weight.requires_grad = False
+                self.emb_B.weight.requires_grad = False
+        
+        # Optimize memory by removing unused backbone head
+        if optimize_memory:
+            if hasattr(self.backbone, 'lm_head'):
+                self.backbone.lm_head = None
+            elif hasattr(self.backbone, 'embed_out'):
+                self.backbone.embed_out = None
 
         if freeze_backbone:
             for param in self.backbone.parameters():

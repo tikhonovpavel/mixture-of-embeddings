@@ -139,46 +139,59 @@ class Trainer:
     
     def _setup_optimizer(self):
         """Setup optimizer with parameter groups."""
+        candidate_modules = []
+        
+        # Identify which modules contain embedding/unembedding parameters
         if self.objective == 'separate' or self.objective == 'separate_distillation':
             if self.shared_embeddings:
-                trainable_params = [
-                    self.model.emb.parameters(),
-                    self.model.unemb_A.parameters(),
-                    self.model.unemb_B.parameters()
+                candidate_modules = [
+                    self.model.emb,
+                    self.model.unemb_A,
+                    self.model.unemb_B
                 ]
             else:
-                trainable_params = [
-                    self.model.emb_A.parameters(),
-                    self.model.emb_B.parameters(),
-                    self.model.unemb_A.parameters(),
-                    self.model.unemb_B.parameters()
+                candidate_modules = [
+                    self.model.emb_A,
+                    self.model.emb_B,
+                    self.model.unemb_A,
+                    self.model.unemb_B
                 ]
         else:  # averaged, mixup, or distillation
             if self.shared_embeddings:
-                trainable_params = [
-                    self.model.emb.parameters(),
-                    self.model.unemb.parameters()
+                candidate_modules = [
+                    self.model.emb,
+                    self.model.unemb
                 ]
             else:
-                trainable_params = [
-                    self.model.emb_A.parameters(),
-                    self.model.emb_B.parameters(),
-                    self.model.unemb.parameters()
+                candidate_modules = [
+                    self.model.emb_A,
+                    self.model.emb_B,
+                    self.model.unemb
                 ]
         
-        # Add stream tags to trainable parameters
+        # Filter parameters to only include those requiring gradients
+        trainable_embedding_params = []
+        for module in candidate_modules:
+            trainable_embedding_params.extend([p for p in module.parameters() if p.requires_grad])
+
+        # Add stream projs (always trained)
         stream_params = list(self.model.stream_proj_A.parameters()) + \
                         list(self.model.stream_proj_B.parameters())
-        self.embedding_params = [p for group in trainable_params for p in group] + stream_params
         
-        if self.freeze_backbone:
-            self.optimizer = torch.optim.AdamW(self.embedding_params, lr=self.learning_rate)
-        else:
-            self.optimizer = torch.optim.AdamW([
-                {'params': self.embedding_params, 'lr': self.learning_rate},
-                {'params': self.model.backbone.parameters(), 'lr': self.backbone_lr}
-            ])
-    
+        # Combine parameters
+        self.embedding_params = trainable_embedding_params + stream_params
+        
+        # Build optimizer groups
+        optimizer_groups = [
+            {'params': self.embedding_params, 'lr': self.learning_rate}
+        ]
+        
+        if not self.freeze_backbone:
+            backbone_params = [p for p in self.model.backbone.parameters() if p.requires_grad]
+            optimizer_groups.append({'params': backbone_params, 'lr': self.backbone_lr})
+            
+        self.optimizer = torch.optim.AdamW(optimizer_groups)
+
     def _setup_live_config(self):
         """Setup or load live configuration."""
         config = {
