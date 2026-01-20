@@ -1,0 +1,84 @@
+Loading config from /disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20251224_185822/training_config.json
+Loading checkpoint from: /disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20251224_185822/checkpoint-200000/model.pt
+Model config: objective=separate, shared_embeddings=True
+Model loaded successfully (step 200000)
+
+Loading separator model: EleutherAI/pythia-160m
+Separator model loaded successfully
+
+Loading full vanilla model for comparison: EleutherAI/pythia-2.8b
+Full vanilla model loaded successfully
+
+Loading cached dataset from: /disk/4tb/tikhonov/projects/mixture-of-embeddings/all_runs_analysis/common_eval_cache_fineweb_deep.json
+Loaded 2000 samples from cache.
+
+================================================================================
+EVALUATION CONFIGURATION
+================================================================================
+Mode: Evaluating CHECKPOINT '/disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20251224_185822/checkpoint-200000/model.pt'
+Using separator model: True
+Base Model: EleutherAI/pythia-2.8b
+Separator model: EleutherAI/pythia-160m
+Dataset: HuggingFaceFW/fineweb
+Seed: 42
+Train steps skipped: 250,000
+Train batch size: 8
+Train samples skipped: 4,000,000
+Number of eval samples: 200
+Context length: 32
+Eval length: 16
+Top-K mask: 30
+
+================================================================================
+EVALUATION RESULTS
+================================================================================
+Mode: WITH separator model
+Number of evaluated pairs: 200
+
+--------------------------------------------------------------------------------
+PERPLEXITY (on non-missed tokens):
+  Text A: mean=9.59 ± 8.26, median=6.70
+  Text B: mean=9.09 ± 9.55, median=7.13
+  Average: mean=9.34 ± 6.17, median=7.81
+
+--------------------------------------------------------------------------------
+FILTER MISS RATE (true token outside top-K mask):
+  Text A: mean=33.34%, median=31.25%
+  Text B: mean=33.50%, median=31.25%
+  Average: mean=33.42%, median=34.38%
+
+--------------------------------------------------------------------------------
+TOKEN ACCURACY:
+  Text A: mean=30.53% ± 12.99%, median=31.25%
+  Text B: mean=31.62% ± 13.47%, median=31.25%
+  Average: mean=31.08% ± 9.98%, median=31.25%
+
+--------------------------------------------------------------------------------
+TRUE TOKEN RANK (on non-missed tokens):
+  Text A: mean=4.47 ± 2.08, median=4.27
+  Text B: mean=4.24 ± 1.93, median=4.00
+  Average: mean=4.37 ± 1.35, median=4.26
+
+--------------------------------------------------------------------------------
+--- METRICS AGAINST VANILLA MODEL'S PREDICTION ---
+
+VANILLA TARGET MISS RATE (vanilla's top token outside our mask):
+  Text A: mean=12.50%, median=12.50%
+  Text B: mean=12.69%, median=12.50%
+  Average: mean=12.59%, median=12.50%
+
+VANILLA TARGET ACCURACY (our argmax == vanilla's argmax):
+  Text A: mean=48.12% ± 13.46%, median=50.00%
+  Text B: mean=50.12% ± 13.75%, median=50.00%
+  Average: mean=49.12% ± 10.00%, median=50.00%
+
+VANILLA TARGET PERPLEXITY (on non-missed vanilla targets):
+  Text A: mean=6.27 ± 4.01, median=5.14
+  Text B: mean=6.10 ± 4.09, median=5.02
+
+VANILLA MODEL'S TOP TOKEN RANK (on non-missed vanilla targets):
+  Text A: mean=3.61 ± 1.62, median=3.31
+  Text B: mean=3.52 ± 1.64, median=3.23
+  Average: mean=3.57 ± 1.15, median=3.45
+================================================================================
+

@@ -1,0 +1,93 @@
+Loading config from /disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20260107_110217/training_config.json
+Loading checkpoint from: /disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20260107_110217/checkpoint-160000/model.pt
+Model config: objective=separate_distillation, shared_embeddings=True
+
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
+Loading checkpoint shards:  25%|██▌       | 1/4 [00:01<00:04,  1.53s/it]
+Loading checkpoint shards:  50%|█████     | 2/4 [00:02<00:02,  1.48s/it]
+Loading checkpoint shards:  75%|███████▌  | 3/4 [00:04<00:01,  1.37s/it]
+Loading checkpoint shards: 100%|██████████| 4/4 [00:04<00:00,  1.06s/it]
+Warning: Loading with strict=False due to mismatch: Error(s) in loading state_dict for DualStreamLLM:...
+Model loaded successfully (step 160000)
+
+Running in BASELINE mode (without separator model)
+
+Loading full vanilla model for comparison: unsloth/Llama-3.1-8B
+
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
+Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 65.42it/s]
+Full vanilla model loaded successfully
+
+Loading cached dataset from: /disk/4tb/tikhonov/projects/mixture-of-embeddings/all_runs_analysis/common_eval_cache_fineweb_deep.json
+Loaded 2000 samples from cache.
+
+================================================================================
+EVALUATION CONFIGURATION
+================================================================================
+Mode: Evaluating CHECKPOINT '/disk/4tb/tikhonov/projects/mixture-of-embeddings/checkpoints/run_20260107_110217/checkpoint-160000/model.pt'
+Using separator model: False
+Base Model: unsloth/Llama-3.1-8B
+Separator model: N/A
+Dataset: HuggingFaceFW/fineweb
+Seed: 42
+Train steps skipped: 250,000
+Train batch size: 8
+Train samples skipped: 4,000,000
+Number of eval samples: 200
+Context length: 32
+Eval length: 16
+Top-K mask: N/A
+
+================================================================================
+EVALUATION RESULTS
+================================================================================
+Mode: BASELINE
+Number of evaluated pairs: 200
+
+--------------------------------------------------------------------------------
+PERPLEXITY (on non-missed tokens):
+  Text A: mean=718.20 ± 2192.54, median=281.21
+  Text B: mean=676.50 ± 2009.83, median=275.17
+  Average: mean=697.35 ± 1520.00, median=369.08
+
+--------------------------------------------------------------------------------
+FILTER MISS RATE (true token outside top-K mask):
+  Text A: mean=0.00%, median=0.00%
+  Text B: mean=0.00%, median=0.00%
+  Average: mean=0.00%, median=0.00%
+
+--------------------------------------------------------------------------------
+TOKEN ACCURACY:
+  Text A: mean=17.59% ± 10.25%, median=18.75%
+  Text B: mean=17.94% ± 10.39%, median=18.75%
+  Average: mean=17.77% ± 7.12%, median=15.62%
+
+--------------------------------------------------------------------------------
+TRUE TOKEN RANK (on non-missed tokens):
+  Text A: mean=662.07 ± 665.90, median=436.25
+  Text B: mean=658.23 ± 801.62, median=405.06
+  Average: mean=660.15 ± 514.61, median=505.95
+
+--------------------------------------------------------------------------------
+--- METRICS AGAINST VANILLA MODEL'S PREDICTION ---
+
+VANILLA TARGET MISS RATE (vanilla's top token outside our mask):
+  Text A: mean=0.00%, median=0.00%
+  Text B: mean=0.00%, median=0.00%
+  Average: mean=0.00%, median=0.00%
+
+VANILLA TARGET ACCURACY (our argmax == vanilla's argmax):
+  Text A: mean=28.44% ± 11.59%, median=28.12%
+  Text B: mean=27.50% ± 13.14%, median=25.00%
+  Average: mean=27.97% ± 8.45%, median=28.12%
+
+VANILLA TARGET PERPLEXITY (on non-missed vanilla targets):
+  Text A: mean=263.66 ± 1119.74, median=88.09
+  Text B: mean=326.53 ± 1996.94, median=88.87
+
+VANILLA MODEL'S TOP TOKEN RANK (on non-missed vanilla targets):
+  Text A: mean=466.87 ± 678.85, median=243.72
+  Text B: mean=419.48 ± 917.45, median=180.44
+  Average: mean=443.18 ± 561.65, median=274.92
+================================================================================
+

@@ -34,18 +34,20 @@ def load_checkpoint(checkpoint_path, model_name, device, objective='distillation
         else:
             model.load_state_dict(checkpoint, strict=True)
     except RuntimeError as e:
-        # Check if error is due to missing stream_proj keys (backward compatibility for old runs)
         error_msg = str(e)
-        if 'stream_proj_A.weight' in error_msg and 'stream_proj_B.weight' in error_msg:
-            print("Warning: Checkpoint is missing stream projection weights (old version).")
-            print("Initializing stream projections as STRICT Identity matrices (no noise) for compatibility.")
+        
+        # Check if error is due to missing keys (lm_head due to optimize_memory or stream_proj in old runs)
+        if 'lm_head' in error_msg or 'stream_proj' in error_msg:
+            print(f"Warning: Loading with strict=False due to mismatch: {error_msg.splitlines()[0]}...")
             
-            # Force exact Identity (remove the noise added in __init__)
-            with torch.no_grad():
-                model.stream_proj_A.weight.copy_(torch.eye(model.stream_proj_A.weight.shape[0]))
-                model.stream_proj_B.weight.copy_(torch.eye(model.stream_proj_B.weight.shape[0]))
+            # Handle backward compatibility for old checkpoints missing stream projections
+            if 'stream_proj' in error_msg:
+                print("Initializing stream projections as Identity for backward compatibility.")
+                with torch.no_grad():
+                    model.stream_proj_A.weight.copy_(torch.eye(model.stream_proj_A.weight.shape[0]))
+                    model.stream_proj_B.weight.copy_(torch.eye(model.stream_proj_B.weight.shape[0]))
             
-            # Load with strict=False to ignore missing keys
+            # Retry loading with strict=False to ignore missing/extra keys
             if 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             else:
@@ -644,6 +646,39 @@ def evaluate(
         'avg_vanilla_miss_rate': np.std([r['avg_vanilla_miss_rate'] for r in results]),
     }
     
+    median_metrics = {
+        'perplexity_a': np.nanmedian([r['perplexity_a'] for r in results if r['perplexity_a'] != float('inf')]),
+        'perplexity_b': np.nanmedian([r['perplexity_b'] for r in results if r['perplexity_b'] != float('inf')]),
+        'avg_perplexity': np.nanmedian([r['avg_perplexity'] for r in results if r['avg_perplexity'] != float('inf')]),
+        
+        'accuracy_a': np.median([r['accuracy_a'] for r in results]),
+        'accuracy_b': np.median([r['accuracy_b'] for r in results]),
+        'avg_accuracy': np.median([r['avg_accuracy'] for r in results]),
+        
+        'avg_rank_a': np.median([r['avg_rank_a'] for r in results if r['avg_rank_a'] != -1]),
+        'avg_rank_b': np.median([r['avg_rank_b'] for r in results if r['avg_rank_b'] != -1]),
+        'avg_rank': np.median([r['avg_rank'] for r in results if r['avg_rank'] != -1]),
+        
+        'vanilla_accuracy_a': np.median([r['vanilla_accuracy_a'] for r in results]),
+        'vanilla_accuracy_b': np.median([r['vanilla_accuracy_b'] for r in results]),
+        'avg_vanilla_accuracy': np.median([r['avg_vanilla_accuracy'] for r in results]),
+        
+        'vanilla_perplexity_a': np.nanmedian([r['vanilla_perplexity_a'] for r in results if r['vanilla_perplexity_a'] != float('inf')]),
+        'vanilla_perplexity_b': np.nanmedian([r['vanilla_perplexity_b'] for r in results if r['vanilla_perplexity_b'] != float('inf')]),
+        
+        'avg_vanilla_rank_a': np.median([r['avg_vanilla_rank_a'] for r in results if r['avg_vanilla_rank_a'] != -1]),
+        'avg_vanilla_rank_b': np.median([r['avg_vanilla_rank_b'] for r in results if r['avg_vanilla_rank_b'] != -1]),
+        'avg_vanilla_rank': np.median([r['avg_vanilla_rank'] for r in results if r['avg_vanilla_rank'] != -1]),
+        
+        'miss_rate_a': np.median([r['miss_rate_a'] for r in results]),
+        'miss_rate_b': np.median([r['miss_rate_b'] for r in results]),
+        'avg_miss_rate': np.median([r['avg_miss_rate'] for r in results]),
+        
+        'vanilla_miss_rate_a': np.median([r['vanilla_miss_rate_a'] for r in results]),
+        'vanilla_miss_rate_b': np.median([r['vanilla_miss_rate_b'] for r in results]),
+        'avg_vanilla_miss_rate': np.median([r['avg_vanilla_miss_rate'] for r in results]),
+    }
+    
     # Print results
     print(f"\n{'='*80}")
     print(f"EVALUATION RESULTS")
@@ -652,44 +687,44 @@ def evaluate(
     print(f"Number of evaluated pairs: {len(results)}")
     print(f"\n{'-'*80}")
     print(f"PERPLEXITY (on non-missed tokens):")
-    print(f"  Text A: {avg_metrics['perplexity_a']:.2f} ± {std_metrics['perplexity_a']:.2f}")
-    print(f"  Text B: {avg_metrics['perplexity_b']:.2f} ± {std_metrics['perplexity_b']:.2f}")
-    print(f"  Average: {avg_metrics['avg_perplexity']:.2f} ± {std_metrics['avg_perplexity']:.2f}")
+    print(f"  Text A: mean={avg_metrics['perplexity_a']:.2f} ± {std_metrics['perplexity_a']:.2f}, median={median_metrics['perplexity_a']:.2f}")
+    print(f"  Text B: mean={avg_metrics['perplexity_b']:.2f} ± {std_metrics['perplexity_b']:.2f}, median={median_metrics['perplexity_b']:.2f}")
+    print(f"  Average: mean={avg_metrics['avg_perplexity']:.2f} ± {std_metrics['avg_perplexity']:.2f}, median={median_metrics['avg_perplexity']:.2f}")
     print(f"\n{'-'*80}")
     print(f"FILTER MISS RATE (true token outside top-K mask):")
-    print(f"  Text A: {avg_metrics['miss_rate_a']*100:.2f}%")
-    print(f"  Text B: {avg_metrics['miss_rate_b']*100:.2f}%")
-    print(f"  Average: {avg_metrics['avg_miss_rate']*100:.2f}%")
+    print(f"  Text A: mean={avg_metrics['miss_rate_a']*100:.2f}%, median={median_metrics['miss_rate_a']*100:.2f}%")
+    print(f"  Text B: mean={avg_metrics['miss_rate_b']*100:.2f}%, median={median_metrics['miss_rate_b']*100:.2f}%")
+    print(f"  Average: mean={avg_metrics['avg_miss_rate']*100:.2f}%, median={median_metrics['avg_miss_rate']*100:.2f}%")
     print(f"\n{'-'*80}")
     print(f"TOKEN ACCURACY:")
-    print(f"  Text A: {avg_metrics['accuracy_a']*100:.2f}% ± {std_metrics['accuracy_a']*100:.2f}%")
-    print(f"  Text B: {avg_metrics['accuracy_b']*100:.2f}% ± {std_metrics['accuracy_b']*100:.2f}%")
-    print(f"  Average: {avg_metrics['avg_accuracy']*100:.2f}% ± {std_metrics['avg_accuracy']*100:.2f}%")
+    print(f"  Text A: mean={avg_metrics['accuracy_a']*100:.2f}% ± {std_metrics['accuracy_a']*100:.2f}%, median={median_metrics['accuracy_a']*100:.2f}%")
+    print(f"  Text B: mean={avg_metrics['accuracy_b']*100:.2f}% ± {std_metrics['accuracy_b']*100:.2f}%, median={median_metrics['accuracy_b']*100:.2f}%")
+    print(f"  Average: mean={avg_metrics['avg_accuracy']*100:.2f}% ± {std_metrics['avg_accuracy']*100:.2f}%, median={median_metrics['avg_accuracy']*100:.2f}%")
     print(f"\n{'-'*80}")
     print(f"TRUE TOKEN RANK (on non-missed tokens):")
-    print(f"  Text A: {avg_metrics['avg_rank_a']:.2f} ± {std_metrics['avg_rank_a']:.2f}")
-    print(f"  Text B: {avg_metrics['avg_rank_b']:.2f} ± {std_metrics['avg_rank_b']:.2f}")
-    print(f"  Average: {avg_metrics['avg_rank']:.2f} ± {std_metrics['avg_rank']:.2f}")
+    print(f"  Text A: mean={avg_metrics['avg_rank_a']:.2f} ± {std_metrics['avg_rank_a']:.2f}, median={median_metrics['avg_rank_a']:.2f}")
+    print(f"  Text B: mean={avg_metrics['avg_rank_b']:.2f} ± {std_metrics['avg_rank_b']:.2f}, median={median_metrics['avg_rank_b']:.2f}")
+    print(f"  Average: mean={avg_metrics['avg_rank']:.2f} ± {std_metrics['avg_rank']:.2f}, median={median_metrics['avg_rank']:.2f}")
     print(f"\n{'-'*80}")
     print(f"--- METRICS AGAINST VANILLA MODEL'S PREDICTION ---")
     print(f"\nVANILLA TARGET MISS RATE (vanilla's top token outside our mask):")
-    print(f"  Text A: {avg_metrics['vanilla_miss_rate_a']*100:.2f}%")
-    print(f"  Text B: {avg_metrics['vanilla_miss_rate_b']*100:.2f}%")
-    print(f"  Average: {avg_metrics['avg_vanilla_miss_rate']*100:.2f}%")
+    print(f"  Text A: mean={avg_metrics['vanilla_miss_rate_a']*100:.2f}%, median={median_metrics['vanilla_miss_rate_a']*100:.2f}%")
+    print(f"  Text B: mean={avg_metrics['vanilla_miss_rate_b']*100:.2f}%, median={median_metrics['vanilla_miss_rate_b']*100:.2f}%")
+    print(f"  Average: mean={avg_metrics['avg_vanilla_miss_rate']*100:.2f}%, median={median_metrics['avg_vanilla_miss_rate']*100:.2f}%")
     print(f"\nVANILLA TARGET ACCURACY (our argmax == vanilla's argmax):")
-    print(f"  Text A: {avg_metrics['vanilla_accuracy_a']*100:.2f}% ± {std_metrics['vanilla_accuracy_a']*100:.2f}%")
-    print(f"  Text B: {avg_metrics['vanilla_accuracy_b']*100:.2f}% ± {std_metrics['vanilla_accuracy_b']*100:.2f}%")
-    print(f"  Average: {avg_metrics['avg_vanilla_accuracy']*100:.2f}% ± {std_metrics['avg_vanilla_accuracy']*100:.2f}%")
+    print(f"  Text A: mean={avg_metrics['vanilla_accuracy_a']*100:.2f}% ± {std_metrics['vanilla_accuracy_a']*100:.2f}%, median={median_metrics['vanilla_accuracy_a']*100:.2f}%")
+    print(f"  Text B: mean={avg_metrics['vanilla_accuracy_b']*100:.2f}% ± {std_metrics['vanilla_accuracy_b']*100:.2f}%, median={median_metrics['vanilla_accuracy_b']*100:.2f}%")
+    print(f"  Average: mean={avg_metrics['avg_vanilla_accuracy']*100:.2f}% ± {std_metrics['avg_vanilla_accuracy']*100:.2f}%, median={median_metrics['avg_vanilla_accuracy']*100:.2f}%")
     print(f"\nVANILLA TARGET PERPLEXITY (on non-missed vanilla targets):")
-    print(f"  Text A: {avg_metrics['vanilla_perplexity_a']:.2f} ± {std_metrics['vanilla_perplexity_a']:.2f}")
-    print(f"  Text B: {avg_metrics['vanilla_perplexity_b']:.2f} ± {std_metrics['vanilla_perplexity_b']:.2f}")
+    print(f"  Text A: mean={avg_metrics['vanilla_perplexity_a']:.2f} ± {std_metrics['vanilla_perplexity_a']:.2f}, median={median_metrics['vanilla_perplexity_a']:.2f}")
+    print(f"  Text B: mean={avg_metrics['vanilla_perplexity_b']:.2f} ± {std_metrics['vanilla_perplexity_b']:.2f}, median={median_metrics['vanilla_perplexity_b']:.2f}")
     print(f"\nVANILLA MODEL'S TOP TOKEN RANK (on non-missed vanilla targets):")
-    print(f"  Text A: {avg_metrics['avg_vanilla_rank_a']:.2f} ± {std_metrics['avg_vanilla_rank_a']:.2f}")
-    print(f"  Text B: {avg_metrics['avg_vanilla_rank_b']:.2f} ± {std_metrics['avg_vanilla_rank_b']:.2f}")
-    print(f"  Average: {avg_metrics['avg_vanilla_rank']:.2f} ± {std_metrics['avg_vanilla_rank']:.2f}")
+    print(f"  Text A: mean={avg_metrics['avg_vanilla_rank_a']:.2f} ± {std_metrics['avg_vanilla_rank_a']:.2f}, median={median_metrics['avg_vanilla_rank_a']:.2f}")
+    print(f"  Text B: mean={avg_metrics['avg_vanilla_rank_b']:.2f} ± {std_metrics['avg_vanilla_rank_b']:.2f}, median={median_metrics['avg_vanilla_rank_b']:.2f}")
+    print(f"  Average: mean={avg_metrics['avg_vanilla_rank']:.2f} ± {std_metrics['avg_vanilla_rank']:.2f}, median={median_metrics['avg_vanilla_rank']:.2f}")
     print(f"{'='*80}\n")
     
-    return avg_metrics, std_metrics
+    return avg_metrics, std_metrics, median_metrics
 
 
 def forward_with_embedding_scale(dual_model, input_ids, attention_mask, embedding_scale=1.0):
@@ -869,7 +904,8 @@ def evaluate_single_stream(
     objective='distillation',
     shared_embeddings=True,
     config_path=None,
-    cached_dataset_path=None
+    cached_dataset_path=None,
+    output_json_path=None 
 ):
     """
     Evaluate dual-stream model in single-stream mode (no mixing).
@@ -1072,6 +1108,17 @@ def evaluate_single_stream(
         'vanilla_top1_rank_in_dual': np.std([r['vanilla_top1_rank_in_dual'] for r in results]),
     }
     
+    median_metrics = {
+        'dual_perplexity': np.median([r['dual_perplexity'] for r in results]),
+        'vanilla_perplexity': np.median([r['vanilla_perplexity'] for r in results]),
+        'dual_accuracy': np.median([r['dual_accuracy'] for r in results]),
+        'vanilla_accuracy': np.median([r['vanilla_accuracy'] for r in results]),
+        'dual_matches_vanilla': np.median([r['dual_matches_vanilla'] for r in results]),
+        'dual_avg_rank': np.median([r['dual_avg_rank'] for r in results]),
+        'vanilla_avg_rank': np.median([r['vanilla_avg_rank'] for r in results]),
+        'vanilla_top1_rank_in_dual': np.median([r['vanilla_top1_rank_in_dual'] for r in results]),
+    }
+    
     # Print results
     print(f"\n{'='*80}")
     print(f"SINGLE-STREAM EVALUATION RESULTS")
@@ -1079,26 +1126,42 @@ def evaluate_single_stream(
     print(f"Number of evaluated samples: {len(results)}")
     print(f"\n{'-'*80}")
     print(f"PERPLEXITY (lower is better):")
-    print(f"  Dual model:    {avg_metrics['dual_perplexity']:.2f} ± {std_metrics['dual_perplexity']:.2f}")
-    print(f"  Vanilla model: {avg_metrics['vanilla_perplexity']:.2f} ± {std_metrics['vanilla_perplexity']:.2f}")
-    print(f"  Ratio (dual/vanilla): {avg_metrics['dual_perplexity']/avg_metrics['vanilla_perplexity']:.3f}")
+    print(f"  Dual model:    mean={avg_metrics['dual_perplexity']:.2f} ± {std_metrics['dual_perplexity']:.2f}, median={median_metrics['dual_perplexity']:.2f}")
+    print(f"  Vanilla model: mean={avg_metrics['vanilla_perplexity']:.2f} ± {std_metrics['vanilla_perplexity']:.2f}, median={median_metrics['vanilla_perplexity']:.2f}")
+    print(f"  Ratio (dual/vanilla): mean={avg_metrics['dual_perplexity']/avg_metrics['vanilla_perplexity']:.3f}, median={median_metrics['dual_perplexity']/median_metrics['vanilla_perplexity']:.3f}")
     print(f"\n{'-'*80}")
     print(f"TOKEN ACCURACY (higher is better):")
-    print(f"  Dual model:    {avg_metrics['dual_accuracy']*100:.2f}% ± {std_metrics['dual_accuracy']*100:.2f}%")
-    print(f"  Vanilla model: {avg_metrics['vanilla_accuracy']*100:.2f}% ± {std_metrics['vanilla_accuracy']*100:.2f}%")
+    print(f"  Dual model:    mean={avg_metrics['dual_accuracy']*100:.2f}% ± {std_metrics['dual_accuracy']*100:.2f}%, median={median_metrics['dual_accuracy']*100:.2f}%")
+    print(f"  Vanilla model: mean={avg_metrics['vanilla_accuracy']*100:.2f}% ± {std_metrics['vanilla_accuracy']*100:.2f}%, median={median_metrics['vanilla_accuracy']*100:.2f}%")
     print(f"\n{'-'*80}")
     print(f"DUAL-VANILLA AGREEMENT (how often argmax matches):")
-    print(f"  {avg_metrics['dual_matches_vanilla']*100:.2f}% ± {std_metrics['dual_matches_vanilla']*100:.2f}%")
+    print(f"  mean={avg_metrics['dual_matches_vanilla']*100:.2f}% ± {std_metrics['dual_matches_vanilla']*100:.2f}%, median={median_metrics['dual_matches_vanilla']*100:.2f}%")
     print(f"\n{'-'*80}")
     print(f"TRUE TOKEN RANK (lower is better):")
-    print(f"  Dual model:    {avg_metrics['dual_avg_rank']:.2f} ± {std_metrics['dual_avg_rank']:.2f}")
-    print(f"  Vanilla model: {avg_metrics['vanilla_avg_rank']:.2f} ± {std_metrics['vanilla_avg_rank']:.2f}")
+    print(f"  Dual model:    mean={avg_metrics['dual_avg_rank']:.2f} ± {std_metrics['dual_avg_rank']:.2f}, median={median_metrics['dual_avg_rank']:.2f}")
+    print(f"  Vanilla model: mean={avg_metrics['vanilla_avg_rank']:.2f} ± {std_metrics['vanilla_avg_rank']:.2f}, median={median_metrics['vanilla_avg_rank']:.2f}")
     print(f"\n{'-'*80}")
     print(f"VANILLA TOP-1 RANK IN DUAL (lower is better):")
-    print(f"  {avg_metrics['vanilla_top1_rank_in_dual']:.2f} ± {std_metrics['vanilla_top1_rank_in_dual']:.2f}")
+    print(f"  mean={avg_metrics['vanilla_top1_rank_in_dual']:.2f} ± {std_metrics['vanilla_top1_rank_in_dual']:.2f}, median={median_metrics['vanilla_top1_rank_in_dual']:.2f}")
     print(f"{'='*80}\n")
     
-    return avg_metrics, std_metrics
+    if output_json_path:
+        results_data = {
+            "avg": avg_metrics,
+            "std": std_metrics,
+            "median": median_metrics,
+            "config": {
+                "checkpoint": checkpoint_path,
+                "model": model_name,
+                "dataset": dataset_name,
+                "separator": separator_model_name if use_separator_model else None
+            }
+        }
+        with open(output_json_path, 'w') as f:
+            json.dump(results_data, f, indent=4)
+        print(f"\nJSON results saved to: {output_json_path}")
+    
+    return avg_metrics, std_metrics, median_metrics
 
 
 if __name__ == '__main__':

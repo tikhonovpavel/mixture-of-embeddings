@@ -3,3 +3,5 @@ checkpoints/
 wandb/
 tensorboard_logs/
 logs/
+
+RESULT_FOLDER
