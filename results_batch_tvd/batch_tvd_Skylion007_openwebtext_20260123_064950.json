@@ -1,0 +1,66 @@
+{
+  "dataset": "Skylion007/openwebtext",
+  "models": [
+    "EleutherAI/pythia-1b",
+    "Qwen/Qwen2.5-0.5B"
+  ],
+  "num_models": 2,
+  "max_length": 128,
+  "truncate": "min",
+  "sqrt2_norm": false,
+  "mix_depth_percent": 0,
+  "mix_mode": "sum",
+  "summary_by_model": [
+    {
+      "model": "EleutherAI/pythia-1b",
+      "num_sentences": 100,
+      "num_pairs": 50,
+      "num_pairs_evaluated": 50,
+      "num_token_rows": 6400,
+      "sequence_length": 128
+    },
+    {
+      "model": "Qwen/Qwen2.5-0.5B",
+      "num_sentences": 100,
+      "num_pairs": 50,
+      "num_pairs_evaluated": 50,
+      "num_token_rows": 6400,
+      "sequence_length": 128
+    }
+  ],
+  "total_pairs": 100,
+  "total_pairs_evaluated": 100,
+  "total_token_rows": 12800,
+  "aggregate_medians_overall": {
+    "token_position": 63.5,
+    "prob_top1_a": 0.359375,
+    "prob_top1_b": 0.349609375,
+    "rank_top1_a_in_mix_half": 13.5,
+    "rank_top1_b_in_mix_half": 14.0,
+    "tvd_optimal": 0.75390625,
+    "temperature_optimal": 0.8736842105263158,
+    "sequence_length": 128.0
+  },
+  "aggregate_medians_by_model": {
+    "EleutherAI/pythia-1b": {
+      "token_position": 63.5,
+      "prob_top1_a": 0.38671875,
+      "prob_top1_b": 0.373046875,
+      "rank_top1_a_in_mix_half": 17.5,
+      "rank_top1_b_in_mix_half": 16.5,
+      "tvd_optimal": 0.77734375,
+      "temperature_optimal": 0.8736842105263158,
+      "sequence_length": 128.0
+    },
+    "Qwen/Qwen2.5-0.5B": {
+      "token_position": 63.5,
+      "prob_top1_a": 0.337890625,
+      "prob_top1_b": 0.330078125,
+      "rank_top1_a_in_mix_half": 11.0,
+      "rank_top1_b_in_mix_half": 12.0,
+      "tvd_optimal": 0.73046875,
+      "temperature_optimal": 0.8736842105263158,
+      "sequence_length": 128.0
+    }
+  }
+}
