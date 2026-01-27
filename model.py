@@ -8,7 +8,8 @@ class DualStreamLLM(nn.Module):
                  freeze_embeddings=False, optimize_memory=False,
                  embedding_init_strategy='random', embedding_init_noise_std=0.01,
                  unembedding_init_strategy=None,
-                 objective='separate', shared_embeddings=False):
+                 objective='separate', shared_embeddings=False,
+                 use_device_map_auto=False):
         super().__init__()
         self.objective = objective
         self.shared_embeddings = shared_embeddings
@@ -16,15 +17,32 @@ class DualStreamLLM(nn.Module):
         if unembedding_init_strategy is None:
             unembedding_init_strategy = embedding_init_strategy
         
+        # Load backbone with optional device_map='auto' for multi-GPU support
+        backbone_kwargs = {
+            'dtype': torch.bfloat16,
+            'use_cache': False
+        }
+        if use_device_map_auto:
+            backbone_kwargs['device_map'] = 'auto'
+        
         self.backbone = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.bfloat16,
-            use_cache=False
+            **backbone_kwargs
         )
+        
+        # Store whether we used device_map for later reference
+        self.use_device_map_auto = use_device_map_auto
         
         base_model_config = AutoConfig.from_pretrained(model_name)
         vocab_size = base_model_config.vocab_size
         hidden_dim = base_model_config.hidden_size
+        
+        # Determine device for embeddings/unembeddings
+        # If using device_map='auto', get device from backbone's first parameter
+        if use_device_map_auto:
+            embed_device = next(self.backbone.parameters()).device
+        else:
+            embed_device = torch.device('cpu')  # Will be moved to correct device later with .to()
         
         # Embedding initialization
         if shared_embeddings:
@@ -33,23 +51,23 @@ class DualStreamLLM(nn.Module):
                 self.emb = self.backbone.get_input_embeddings()
             else:
                 # Create a new shared embedding matrix for both streams
-                self.emb = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
+                self.emb = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16, device=embed_device)
         else:
             # Separate embedding matrices
-            self.emb_A = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
-            self.emb_B = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16)
+            self.emb_A = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16, device=embed_device)
+            self.emb_B = nn.Embedding(vocab_size, hidden_dim, dtype=torch.bfloat16, device=embed_device)
         
         # Unembedding initialization
         if objective == 'separate' or objective == 'separate_distillation':
-            self.unemb_A = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
-            self.unemb_B = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
+            self.unemb_A = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16, device=embed_device)
+            self.unemb_B = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16, device=embed_device)
         elif objective == 'averaged' or objective == 'mixup' or objective == 'distillation':
-            self.unemb = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16)
+            self.unemb = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16, device=embed_device)
         else:
             raise ValueError(f"Unknown objective: {objective}")
         
-        self.stream_proj_A = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
-        self.stream_proj_B = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16)
+        self.stream_proj_A = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16, device=embed_device)
+        self.stream_proj_B = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.bfloat16, device=embed_device)
         
         # КРИТИЧНО ВАЖНО: Инициализация Identity + шум
         # Чтобы на старте Input = A + B
@@ -142,10 +160,22 @@ class DualStreamLLM(nn.Module):
         # Get embeddings
         if self.shared_embeddings:
             # Use same embedding matrix for both streams
+            # Handle device mismatch when using device_map='auto'
+            if self.use_device_map_auto:
+                input_ids_A = input_ids_A.to(self.emb.weight.device)
+                input_ids_B = input_ids_B.to(self.emb.weight.device)
+                attention_mask_A = attention_mask_A.to(self.emb.weight.device)
+                attention_mask_B = attention_mask_B.to(self.emb.weight.device)
             embeds_A = self.emb(input_ids_A)
             embeds_B = self.emb(input_ids_B)
         else:
             # Use separate embedding matrices
+            # Handle device mismatch when using device_map='auto'
+            if self.use_device_map_auto:
+                input_ids_A = input_ids_A.to(self.emb_A.weight.device)
+                input_ids_B = input_ids_B.to(self.emb_B.weight.device)
+                attention_mask_A = attention_mask_A.to(self.emb_A.weight.device)
+                attention_mask_B = attention_mask_B.to(self.emb_B.weight.device)
             embeds_A = self.emb_A(input_ids_A)
             embeds_B = self.emb_B(input_ids_B)
         
@@ -195,10 +225,17 @@ class DualStreamLLM(nn.Module):
         last_hidden_state = transformer_outputs.last_hidden_state
         
         if self.objective == 'separate' or self.objective == 'separate_distillation':
+            # Handle device mismatch when using device_map='auto'
+            # Move last_hidden_state to the device of the unembedding layer
+            if self.use_device_map_auto:
+                last_hidden_state = last_hidden_state.to(self.unemb_A.weight.device)
             logits_A = self.unemb_A(last_hidden_state)
             logits_B = self.unemb_B(last_hidden_state)
             return logits_A, logits_B
         elif self.objective == 'averaged' or self.objective == 'mixup' or self.objective == 'distillation':
+            # Handle device mismatch when using device_map='auto'
+            if self.use_device_map_auto:
+                last_hidden_state = last_hidden_state.to(self.unemb.weight.device)
             logits = self.unemb(last_hidden_state)
             return logits
         else:

@@ -187,8 +187,15 @@ class Trainer:
         ]
         
         if not self.freeze_backbone:
-            backbone_params = [p for p in self.model.backbone.parameters() if p.requires_grad]
-            optimizer_groups.append({'params': backbone_params, 'lr': self.backbone_lr})
+            # Get IDs of parameters already in embedding group to avoid duplicates
+            # This is important when optimize_memory=True, because self.emb IS the backbone embedding
+            embedding_param_ids = set(id(p) for p in self.embedding_params)
+            backbone_params = [
+                p for p in self.model.backbone.parameters() 
+                if p.requires_grad and id(p) not in embedding_param_ids
+            ]
+            if backbone_params:  # Only add group if there are parameters
+                optimizer_groups.append({'params': backbone_params, 'lr': self.backbone_lr})
             
         self.optimizer = torch.optim.AdamW(optimizer_groups)
 

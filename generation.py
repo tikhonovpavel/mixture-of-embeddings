@@ -76,40 +76,42 @@ def generate_samples(
                 generated_B = tokenizer.decode(input_ids_B[0], skip_special_tokens=True)
             
             elif objective in ['averaged', 'mixup', 'distillation']:
-                # For averaged/mixup/distillation objective, generate from each stream independently using pure inputs
-                # Stream A: use lambda=1 (pure A)
-                for _ in range(max_new_tokens):
-                    # For pure A generation, pass same input for both streams (or use lambda=1)
-                    lambdas = torch.ones(1, device=device) if objective == 'mixup' else None
-                    logits = model(input_ids_A, attention_mask_A, input_ids_A, attention_mask_A, lambdas=lambdas)
-                    
-                    logits_scaled = logits[:, -1, :] / temperature
-                    probs = F.softmax(logits_scaled, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                    
-                    input_ids_A = torch.cat([input_ids_A, next_token], dim=1)
-                    attention_mask_A = torch.cat([attention_mask_A, torch.ones((1, 1), device=device)], dim=1)
-                    
-                    if next_token.item() == tokenizer.eos_token_id:
-                        break
+                # For averaged/mixup/distillation objective, generate from MIXED embeddings
+                # This tests what the model actually learned during training
                 
-                # Stream B: use lambda=0 (pure B) 
+                # Pad to same length for proper mixing
+                max_len = max(input_ids_A.size(1), input_ids_B.size(1))
+                if input_ids_A.size(1) < max_len:
+                    pad_len = max_len - input_ids_A.size(1)
+                    input_ids_A = torch.cat([torch.full((1, pad_len), tokenizer.pad_token_id, device=device), input_ids_A], dim=1)
+                    attention_mask_A = torch.cat([torch.zeros((1, pad_len), device=device), attention_mask_A], dim=1)
+                if input_ids_B.size(1) < max_len:
+                    pad_len = max_len - input_ids_B.size(1)
+                    input_ids_B = torch.cat([torch.full((1, pad_len), tokenizer.pad_token_id, device=device), input_ids_B], dim=1)
+                    attention_mask_B = torch.cat([torch.zeros((1, pad_len), device=device), attention_mask_B], dim=1)
+                
+                # Generate from mixed embeddings (what model is trained on)
                 for _ in range(max_new_tokens):
-                    lambdas = torch.zeros(1, device=device) if objective == 'mixup' else None
-                    logits = model(input_ids_B, attention_mask_B, input_ids_B, attention_mask_B, lambdas=lambdas)
+                    lambdas = torch.full((1,), 0.5, device=device) if objective == 'mixup' else None
+                    logits = model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B, lambdas=lambdas)
                     
                     logits_scaled = logits[:, -1, :] / temperature
                     probs = F.softmax(logits_scaled, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                     
+                    # Append same token to both streams to continue mixed generation
+                    input_ids_A = torch.cat([input_ids_A, next_token], dim=1)
                     input_ids_B = torch.cat([input_ids_B, next_token], dim=1)
+                    attention_mask_A = torch.cat([attention_mask_A, torch.ones((1, 1), device=device)], dim=1)
                     attention_mask_B = torch.cat([attention_mask_B, torch.ones((1, 1), device=device)], dim=1)
                     
                     if next_token.item() == tokenizer.eos_token_id:
                         break
                 
-                generated_A = tokenizer.decode(input_ids_A[0], skip_special_tokens=True)
-                generated_B = tokenizer.decode(input_ids_B[0], skip_special_tokens=True)
+                # For these objectives, there's only one output sequence from mixed embeddings
+                generated_mixed = tokenizer.decode(input_ids_A[0], skip_special_tokens=True)
+                generated_A = f"[MIXED] {generated_mixed}"
+                generated_B = f"[Context: A='{prompt_A}' + B='{prompt_B}']"
             
             results.append({
                 'prompt_A': prompt_A,

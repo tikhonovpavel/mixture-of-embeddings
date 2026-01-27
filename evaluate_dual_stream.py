@@ -11,7 +11,7 @@ import json
 from model import DualStreamLLM
 
 
-def load_checkpoint(checkpoint_path, model_name, device, objective='distillation', shared_embeddings=True):
+def load_checkpoint(checkpoint_path, model_name, device, objective='distillation', shared_embeddings=True, use_device_map_auto=False):
     """Load trained DualStreamLLM from checkpoint."""
     print(f"Loading checkpoint from: {checkpoint_path}")
     print(f"Model config: objective={objective}, shared_embeddings={shared_embeddings}")
@@ -24,7 +24,8 @@ def load_checkpoint(checkpoint_path, model_name, device, objective='distillation
         freeze_backbone=True,
         embedding_init_strategy='copy',
         objective=objective,
-        shared_embeddings=shared_embeddings
+        shared_embeddings=shared_embeddings,
+        use_device_map_auto=use_device_map_auto
     )
     
     # Load state dict
@@ -55,11 +56,23 @@ def load_checkpoint(checkpoint_path, model_name, device, objective='distillation
         else:
             raise e
     
-    model = model.to(device)
+    # Only move to device if not using device_map='auto'
+    if not use_device_map_auto:
+        model = model.to(device)
     model.eval()
     
     print(f"Model loaded successfully (step {checkpoint.get('step', 'unknown')})")
     return model
+
+
+def get_model_device(model):
+    """Get the device of the first parameter of a model.
+    Works with both regular models and models using device_map='auto'.
+    """
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def compute_token_accuracy(predicted_tokens, target_tokens):
@@ -102,9 +115,12 @@ def generate_and_evaluate_pair(
     Returns:
         Dictionary with metrics
     """
+    # Get actual device from vanilla model (works with device_map='auto')
+    actual_device = get_model_device(vanilla_model)
+    
     # Tokenize full texts
-    full_tokens_a = tokenizer.encode(text_a, return_tensors='pt').to(device)
-    full_tokens_b = tokenizer.encode(text_b, return_tensors='pt').to(device)
+    full_tokens_a = tokenizer.encode(text_a, return_tensors='pt').to(actual_device)
+    full_tokens_b = tokenizer.encode(text_b, return_tensors='pt').to(actual_device)
     
     # Split into context and target
     context_tokens_a = full_tokens_a[:, :context_len]
@@ -403,14 +419,27 @@ def evaluate(
     torch.manual_seed(seed)
     device = torch.device(device)
     
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Load tokenizer (handle unsloth models)
+    if "unsloth" in model_name.lower():
+        print(f"Unsloth model detected. Trying to load tokenizer from model itself...")
+        # Try to load tokenizer from unsloth model first
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            print(f"Successfully loaded tokenizer from {model_name}")
+        except Exception as e:
+            # If that fails, use a public Llama tokenizer as fallback
+            print(f"Failed to load from {model_name}: {e}")
+            print("Falling back to public Llama 3.1 tokenizer from meta-llama/Llama-3.1-8B-Instruct")
+            tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load dual-stream model
     if checkpoint_path:
-        dual_model = load_checkpoint(checkpoint_path, model_name, device, objective, shared_embeddings)
+        dual_model = load_checkpoint(checkpoint_path, model_name, device, objective, shared_embeddings, use_device_map_auto=True)
     else:
         print("\nNo checkpoint provided. Loading vanilla pre-trained model into DualStreamLLM structure.")
         dual_model = DualStreamLLM(
@@ -418,10 +447,11 @@ def evaluate(
             freeze_backbone=True,
             embedding_init_strategy='copy',
             objective=objective,
-            shared_embeddings=shared_embeddings
-        ).to(device)
+            shared_embeddings=shared_embeddings,
+            use_device_map_auto=True  # Enable device_map='auto' for multi-GPU
+        )
         dual_model.eval()
-        print("Vanilla model loaded successfully.")
+        print("Vanilla model loaded successfully with device_map='auto'")
 
     
     # Load separator model if needed
@@ -431,20 +461,17 @@ def evaluate(
         separator_model = AutoModelForCausalLM.from_pretrained(
             separator_model_name,
             dtype=torch.bfloat16,
-        ).to(device)
+            device_map='auto'
+        )
         separator_model.eval()
         print("Separator model loaded successfully")
     else:
         print("\nRunning in BASELINE mode (without separator model)")
         
-    # Load full vanilla model for comparison metric
-    print(f"\nLoading full vanilla model for comparison: {model_name}")
-    vanilla_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.bfloat16,
-    ).to(device)
+    # Use dual_model.backbone for vanilla predictions (no second copy needed)
+    print(f"\nUsing dual_model.backbone for vanilla comparison (same model, no extra memory)")
+    vanilla_model = dual_model.backbone
     vanilla_model.eval()
-    print("Full vanilla model loaded successfully")
     
     # Load dataset logic with caching
     dataset_iter = None
@@ -796,8 +823,11 @@ def evaluate_single_stream_pair(
     Returns:
         Dictionary with metrics
     """
+    # Get actual device from vanilla model (works with device_map='auto')
+    actual_device = get_model_device(vanilla_model)
+    
     # Tokenize full text
-    full_tokens = tokenizer.encode(text, return_tensors='pt').to(device)
+    full_tokens = tokenizer.encode(text, return_tensors='pt').to(actual_device)
     
     # Split into context and target
     context_tokens = full_tokens[:, :context_len]
@@ -942,14 +972,27 @@ def evaluate_single_stream(
     torch.manual_seed(seed)
     device = torch.device(device)
     
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Load tokenizer (handle unsloth models)
+    if "unsloth" in model_name.lower():
+        print(f"Unsloth model detected. Trying to load tokenizer from model itself...")
+        # Try to load tokenizer from unsloth model first
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            print(f"Successfully loaded tokenizer from {model_name}")
+        except Exception as e:
+            # If that fails, use a public Llama tokenizer as fallback
+            print(f"Failed to load from {model_name}: {e}")
+            print("Falling back to public Llama 3.1 tokenizer from meta-llama/Llama-3.1-8B-Instruct")
+            tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load dual-stream model
     if checkpoint_path:
-        dual_model = load_checkpoint(checkpoint_path, model_name, device, objective, shared_embeddings)
+        dual_model = load_checkpoint(checkpoint_path, model_name, device, objective, shared_embeddings, use_device_map_auto=True)
     else:
         print("\nNo checkpoint provided. Loading vanilla pre-trained model into DualStreamLLM structure.")
         dual_model = DualStreamLLM(
@@ -957,19 +1000,16 @@ def evaluate_single_stream(
             freeze_backbone=True,
             embedding_init_strategy='copy',
             objective=objective,
-            shared_embeddings=shared_embeddings
-        ).to(device)
+            shared_embeddings=shared_embeddings,
+            use_device_map_auto=True  # Enable device_map='auto' for multi-GPU
+        )
         dual_model.eval()
-        print("Vanilla model loaded successfully.")
+        print("Vanilla model loaded successfully with device_map='auto'")
     
-    # Load vanilla model for comparison
-    print(f"\nLoading vanilla model for comparison: {model_name}")
-    vanilla_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.bfloat16,
-    ).to(device)
+    # Use dual_model.backbone for vanilla predictions (no second copy needed)
+    print(f"\nUsing dual_model.backbone for vanilla comparison (same model, no extra memory)")
+    vanilla_model = dual_model.backbone
     vanilla_model.eval()
-    print("Vanilla model loaded successfully")
     
     # Load dataset logic with caching
     dataset_iter = None
@@ -1154,7 +1194,7 @@ def evaluate_single_stream(
                 "checkpoint": checkpoint_path,
                 "model": model_name,
                 "dataset": dataset_name,
-                "separator": separator_model_name if use_separator_model else None
+                "embedding_scale": embedding_scale
             }
         }
         with open(output_json_path, 'w') as f:
