@@ -772,7 +772,7 @@ class Trainer:
         
         # Fast-forward dataloader if resuming
         if self.resume_num_samples > 0:
-            self._fast_forward_dataloader(data_iter)
+            data_iter = self._fast_forward_dataloader(data_iter)
         
         # Calculate starting optimizer step based on samples seen
         batch_size = self.dataloader.batch_size // 2  # Actual input examples per batch
@@ -987,16 +987,38 @@ class Trainer:
         try:
             if self.resume_num_samples == 0:
                 print(f"[Rank {self.rank}] No fast-forward needed (starting from beginning).")
-                return
+                return data_iter
             
-            # Calculate how many batches to skip
-            # Note: DualStreamCollator creates 2 samples per input, so actual_batch_size = batch_size * 2
-            # But we want to count unique input examples, not the dual-stream pairs
-            # Each batch processes batch_size input examples (which become batch_size*2 training pairs)
-            batch_size = self.dataloader.batch_size // 2  # Divide by 2 because collator doubles it
+            # DualStreamCollator consumes 2 dataset elements per training pair:
+            # - batch[::2] for stream A
+            # - batch[1::2] for stream B
+            # So if we've seen N training pairs, we need to skip 2*N elements in the dataset
+            samples_to_skip_in_dataset = self.resume_num_samples * 2
+            
+            print(f"[Rank {self.rank}] Fast-forwarding dataset by {samples_to_skip_in_dataset} samples ({self.resume_num_samples} training pairs seen)...")
+            
+            # Use dataset.skip() for fast forward (much faster than iterating)
+            dataset = self.dataloader.dataset
+            skipped_dataset = dataset.skip(samples_to_skip_in_dataset)
+            
+            # Recreate dataloader with skipped dataset
+            self.dataloader = DataLoader(
+                skipped_dataset,
+                batch_size=self.dataloader.batch_size,
+                collate_fn=self.dataloader.collate_fn,
+            )
+            
+            print(f"[Rank {self.rank}] Fast-forward complete. Dataset positioned at sample {samples_to_skip_in_dataset}.")
+            
+            # Return new iterator from the skipped dataloader
+            return iter(self.dataloader)
+            
+        except Exception as e:
+            print(f"[Rank {self.rank}] Warning: failed to fast-forward using .skip() ({e}), falling back to manual skip")
+            # Fallback to manual iteration if .skip() fails
+            batch_size = self.dataloader.batch_size // 2
             num_batches_to_skip = self.resume_num_samples // batch_size
             
-            print(f"[Rank {self.rank}] Fast-forwarding dataloader by {num_batches_to_skip} batches ({self.resume_num_samples} samples) to resume position...")
             if self.rank == 0:
                 ffbar = tqdm(range(num_batches_to_skip), desc=f"Fast-forward dataloader (rank {self.rank})")
             else:
@@ -1007,9 +1029,8 @@ class Trainer:
                 except StopIteration:
                     data_iter = iter(self.dataloader)
                     _ = next(data_iter)
-            print(f"[Rank {self.rank}] Fast-forward complete. Resuming training from sample {self.resume_num_samples}.")
-        except Exception as e:
-            print(f"[Rank {self.rank}] Warning: failed to fast-forward dataloader ({e}).")
+            print(f"[Rank {self.rank}] Fast-forward complete.")
+            return data_iter
     
     def _clip_gradients(self):
         """Clip gradients and return gradient norm."""
