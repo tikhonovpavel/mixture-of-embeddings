@@ -61,6 +61,7 @@ def train(
     teacher_model_name=None,  # Teacher model name. If None, uses same as model_name
     teacher_load_in_8bit=True,
     distillation_temperature=2.0,  # Temperature for softening teacher distributions
+    distillation_type='kl_geodesic',  # 'naive_average' (average probabilities) or 'kl_geodesic' (average logits)
     # Same text probability
     same_text_prob=0.2,  # Probability of using same text for both streams
     # Loss balancing parameters
@@ -75,7 +76,11 @@ def train(
     # Resume parameters
     resume_from_checkpoint=None,
     continue_run=None,
-    gradient_accumulation_steps=2
+    gradient_accumulation_steps=2,
+    grad_clip=1.0,
+    # Resume warmup (helps optimizer adapt when changing hyperparameters)
+    resume_warmup_steps=0,  # Number of steps to warmup after resume (0 = disabled)
+    resume_warmup_lr_factor=0.1,  # LR multiplier at start of warmup (linearly increases to 1.0)
 ):
     """Main training function."""
     # Set seed for reproducibility
@@ -87,13 +92,12 @@ def train(
     old_tensorboard_dir = None
     
     # Handle continue_run and resume logic
+    resume_num_samples = 0
     if continue_run:
-        output_dir, tensorboard_log_dir, resume_step, checkpoint_data, old_tensorboard_dir = \
+        output_dir, tensorboard_log_dir, resume_step, resume_num_samples, checkpoint_data, old_tensorboard_dir = \
             _handle_continue_run(
                 continue_run, resume_from_checkpoint, tensorboard_log_dir,
-                learning_rate, backbone_lr, temperature, log_interval, similarity_log_interval,
-                eval_interval, loss_balance_strength, loss_balance_ema_momentum,
-                loss_balance_clip_min, loss_balance_clip_max
+                batch_size, gradient_accumulation_steps
             )
     else:
         # Create new run
@@ -153,7 +157,7 @@ def train(
             mixup_alpha, same_text_prob, loss_balance_strength, loss_balance_ema_momentum,
             loss_balance_warmup_steps, loss_balance_clip_min, loss_balance_clip_max,
             lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps,
-            teacher_model_name, teacher_load_in_8bit, distillation_temperature
+            teacher_model_name, teacher_load_in_8bit, distillation_temperature, distillation_type, grad_clip
         )
         
         config_json_path = os.path.join(output_dir, 'training_config.json')
@@ -164,7 +168,7 @@ def train(
         _print_training_info(rank, world_size, device, model_name, dataset_name, dataset_config,
                              objective, use_loss_balancing, shared_embeddings, batch_size,
                              gradient_accumulation_steps, learning_rate, backbone_lr, freeze_backbone,
-                             freeze_embeddings, optimize_memory, num_train_steps, seed, output_dir)
+                             freeze_embeddings, optimize_memory, num_train_steps, seed, output_dir, grad_clip)
     
     # Setup logger and log configuration
     logger = TrainingLogger(tensorboard_log_dir, rank)
@@ -203,7 +207,7 @@ def train(
     # Setup collator and dataloader
     collate_fn = DualStreamCollator(tokenizer, max_length=max_length, objective=objective, 
                                     mixup_alpha=mixup_alpha, same_text_prob=same_text_prob)
-    dataloader = DataLoader(dataset, batch_size=batch_size * 2, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
     
     model = DualStreamLLM(
         model_name=model_name,
@@ -269,6 +273,7 @@ def train(
         freeze_backbone=freeze_backbone,
         num_train_steps=num_train_steps,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        grad_clip=grad_clip,
         objective=objective,
         use_loss_balancing=use_loss_balancing,
         shared_embeddings=shared_embeddings,
@@ -287,9 +292,13 @@ def train(
         temperature=temperature,
         validation_prompts=validation_prompts,
         resume_step=resume_step,
+        resume_num_samples=resume_num_samples,
         checkpoint_data=checkpoint_data,
         teacher_model=teacher_model,
         distillation_temperature=distillation_temperature,
+        distillation_type=distillation_type,
+        resume_warmup_steps=resume_warmup_steps,
+        resume_warmup_lr_factor=resume_warmup_lr_factor,
     )
     
     # Train
@@ -305,9 +314,7 @@ def train(
 
 def _handle_continue_run(
     continue_run, resume_from_checkpoint, tensorboard_log_dir,
-    learning_rate, backbone_lr, temperature, log_interval, similarity_log_interval,
-    eval_interval, loss_balance_strength, loss_balance_ema_momentum,
-    loss_balance_clip_min, loss_balance_clip_max
+    current_batch_size, current_grad_accum
 ):
     """Handle continue_run logic."""
     if not os.path.exists(continue_run):
@@ -321,14 +328,10 @@ def _handle_continue_run(
     if tensorboard_log_dir:
         old_tensorboard_dir = os.path.join(tensorboard_log_dir, old_run_name)
     
-    # Load existing live config
-    old_live_config_path = os.path.join(old_checkpoint_dir, 'live_config.json')
-    config_manager = ConfigManager(old_live_config_path)
-    existing_live_config = config_manager.load_config()
-    
     # Handle resume from checkpoint
     checkpoint_data = None
     resume_step = 0
+    resume_num_samples = 0
     if resume_from_checkpoint:
         checkpoint_manager = CheckpointManager(old_checkpoint_dir)
         if resume_from_checkpoint == 'auto':
@@ -351,7 +354,27 @@ def _handle_continue_run(
         # Load checkpoint
         checkpoint_data = torch.load(checkpoint_path, map_location='cpu')
         resume_step = checkpoint_data.get('step', 0)
-        print(f"Resuming from step {resume_step}")
+        
+        # Get num_samples_seen from checkpoint, or calculate from old step if not available
+        resume_num_samples = checkpoint_data.get('num_samples_seen', None)
+        if resume_num_samples is None:
+            # Backward compatibility: calculate from old training config
+            old_config_path = os.path.join(old_checkpoint_dir, 'training_config.json')
+            if os.path.exists(old_config_path):
+                with open(old_config_path, 'r') as f:
+                    old_config = json.load(f)
+                old_batch_size = old_config.get('batch_size', current_batch_size)
+                old_grad_accum = old_config.get('gradient_accumulation_steps', current_grad_accum)
+                old_effective_batch = old_batch_size * old_grad_accum
+                resume_num_samples = resume_step * old_effective_batch
+                print(f"[Backward compatibility] Calculated num_samples_seen from old config: {resume_num_samples}")
+            else:
+                # Fallback: use current config
+                current_effective_batch = current_batch_size * current_grad_accum
+                resume_num_samples = resume_step * current_effective_batch
+                print(f"[Warning] No training_config.json found, using current batch settings to estimate samples")
+        
+        print(f"Resuming from optimizer step {resume_step} ({resume_num_samples} samples seen)")
     
     # Create NEW run directory with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -366,20 +389,7 @@ def _handle_continue_run(
         tensorboard_log_dir = os.path.join(tensorboard_log_dir, run_name)
         os.makedirs(tensorboard_log_dir, exist_ok=True)
     
-    # Update parameters from existing live config if available
-    if existing_live_config:
-        learning_rate = existing_live_config.get('learning_rate', learning_rate)
-        backbone_lr = existing_live_config.get('backbone_lr', backbone_lr)
-        temperature = existing_live_config.get('temperature', temperature)
-        log_interval = existing_live_config.get('log_interval', log_interval)
-        similarity_log_interval = existing_live_config.get('similarity_log_interval', similarity_log_interval)
-        eval_interval = existing_live_config.get('eval_interval', eval_interval)
-        loss_balance_strength = existing_live_config.get('loss_balance_strength', loss_balance_strength)
-        loss_balance_ema_momentum = existing_live_config.get('loss_balance_ema_momentum', loss_balance_ema_momentum)
-        loss_balance_clip_min = existing_live_config.get('loss_balance_clip_min', loss_balance_clip_min)
-        loss_balance_clip_max = existing_live_config.get('loss_balance_clip_max', loss_balance_clip_max)
-    
-    return output_dir, tensorboard_log_dir, resume_step, checkpoint_data, old_tensorboard_dir
+    return output_dir, tensorboard_log_dir, resume_step, resume_num_samples, checkpoint_data, old_tensorboard_dir
 
 
 def _load_teacher_model(model_name: str, load_in_8bit: bool, device, rank: int):
@@ -424,7 +434,7 @@ def _create_config_dict(
     mixup_alpha, same_text_prob, loss_balance_strength, loss_balance_ema_momentum,
     loss_balance_warmup_steps, loss_balance_clip_min, loss_balance_clip_max,
     lr_scheduler_patience, lr_scheduler_factor, gradient_accumulation_steps,
-    teacher_model_name, teacher_load_in_8bit, distillation_temperature
+    teacher_model_name, teacher_load_in_8bit, distillation_temperature, distillation_type, grad_clip
 ):
     """Create configuration dictionary."""
     return {
@@ -459,6 +469,7 @@ def _create_config_dict(
         'teacher_model_name': teacher_model_name,
         'teacher_load_in_8bit': teacher_load_in_8bit,
         'distillation_temperature': distillation_temperature,
+        'distillation_type': distillation_type,
         'loss_balance_strength': loss_balance_strength,
         'loss_balance_ema_momentum': loss_balance_ema_momentum,
         'loss_balance_warmup_steps': loss_balance_warmup_steps,
@@ -467,6 +478,7 @@ def _create_config_dict(
         'lr_scheduler_patience': lr_scheduler_patience,
         'lr_scheduler_factor': lr_scheduler_factor,
         'gradient_accumulation_steps': gradient_accumulation_steps,
+        'grad_clip': grad_clip,
         'world_size': 1  # Will be updated by trainer
     }
 
@@ -475,7 +487,7 @@ def _print_training_info(
     objective, use_loss_balancing, shared_embeddings, batch_size,
     gradient_accumulation_steps, learning_rate, backbone_lr, freeze_backbone,
     freeze_embeddings, optimize_memory,
-    num_train_steps, seed, output_dir
+    num_train_steps, seed, output_dir, grad_clip
 ):
     """Print training information."""
     print(f"\n{'='*80}")
@@ -496,6 +508,7 @@ def _print_training_info(
     print(f"Batch size per GPU: {batch_size}")
     print(f"Effective global batch size: {batch_size * world_size * gradient_accumulation_steps}")
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"Gradient clipping norm: {grad_clip}")
     print(f"\n{'='*80}")
     print(f"TRAINING PARAMETERS")
     print(f"{'='*80}")

@@ -54,13 +54,14 @@ class CheckpointManager:
         alpha: float,
         beta: float,
         ema_loss_A: Optional[float],
-        ema_loss_B: Optional[float]
+        ema_loss_B: Optional[float],
+        num_samples_seen: Optional[int] = None
     ):
         """Save a checkpoint."""
         checkpoint_dir = os.path.join(self.output_dir, f"checkpoint-{step}")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        torch.save({
+        checkpoint_dict = {
             'step': step,
             'model_state_dict': model_state_dict,
             'optimizer_state_dict': optimizer_state_dict,
@@ -69,9 +70,15 @@ class CheckpointManager:
             'beta': beta,
             'ema_loss_A': ema_loss_A,
             'ema_loss_B': ema_loss_B,
-        }, os.path.join(checkpoint_dir, 'model.pt'))
+        }
         
-        print(f"Checkpoint saved at step {step}")
+        # Add num_samples_seen if provided (for proper resume with different batch sizes)
+        if num_samples_seen is not None:
+            checkpoint_dict['num_samples_seen'] = num_samples_seen
+        
+        torch.save(checkpoint_dict, os.path.join(checkpoint_dir, 'model.pt'))
+        
+        print(f"Checkpoint saved at step {step} ({num_samples_seen} samples seen)")
     
     def load_checkpoint(self, checkpoint_path: str) -> dict:
         """Load a checkpoint from path."""

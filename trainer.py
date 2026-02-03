@@ -38,6 +38,7 @@ class Trainer:
         freeze_backbone: bool,
         num_train_steps: int,
         gradient_accumulation_steps: int,
+        grad_clip: float,
         # Objectives and loss
         objective: str,
         use_loss_balancing: bool,
@@ -61,10 +62,15 @@ class Trainer:
         validation_prompts: list,
         # Resume
         resume_step: int = 0,
+        resume_num_samples: int = 0,
         checkpoint_data: dict = None,
         # Distillation
         teacher_model = None,
         distillation_temperature: float = 2.0,
+        distillation_type: str = 'kl_geodesic',
+        # Resume warmup (optional)
+        resume_warmup_steps: int = 0,
+        resume_warmup_lr_factor: float = 0.1,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -80,6 +86,7 @@ class Trainer:
         self.freeze_backbone = freeze_backbone
         self.num_train_steps = num_train_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.grad_clip = grad_clip
         
         self.objective = objective
         self.use_loss_balancing = use_loss_balancing
@@ -100,9 +107,17 @@ class Trainer:
         self.validation_prompts = validation_prompts
         
         self.resume_step = resume_step
+        self.resume_num_samples = resume_num_samples
+        self.num_samples_seen = resume_num_samples  # Track total samples seen
+        
+        # Resume warmup parameters
+        self.resume_warmup_steps = resume_warmup_steps
+        self.resume_warmup_lr_factor = resume_warmup_lr_factor
+        self.in_resume_warmup = resume_warmup_steps > 0 and resume_num_samples > 0
         
         self.teacher_model = teacher_model
         self.distillation_temperature = distillation_temperature
+        self.distillation_type = distillation_type
         
         # Setup managers
         self.checkpoint_manager = CheckpointManager(output_dir)
@@ -205,6 +220,7 @@ class Trainer:
             "learning_rate": self.learning_rate,
             "backbone_lr": self.backbone_lr,
             "temperature": self.temperature,
+            "grad_clip": self.grad_clip,
             "log_interval": self.log_interval,
             "similarity_log_interval": self.similarity_log_interval,
             "eval_interval": self.eval_interval,
@@ -227,17 +243,27 @@ class Trainer:
             for k in keys_to_remove:
                 del state_dict[k]
         self.model.load_state_dict(state_dict)
-        print("Loading optimizer state dict...")  
-        self.optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint_data:
-            self.scheduler.load_state_dict(checkpoint_data['scheduler_state_dict'])
-            print("Loading scheduler state dict...")
         
-        # Restore loss balancing variables
-        self.ema_loss_A = checkpoint_data.get('ema_loss_A', None)
-        self.ema_loss_B = checkpoint_data.get('ema_loss_B', None)
-        self.alpha = checkpoint_data.get('alpha', 1.0)
-        self.beta = checkpoint_data.get('beta', 1.0)
+        # Skip optimizer/scheduler loading if doing resume warmup
+        if self.in_resume_warmup:
+            print("Resume warmup enabled - skipping optimizer and scheduler state loading (fresh start)")
+            # Reset loss balancing as well
+            self.ema_loss_A = None
+            self.ema_loss_B = None
+            self.alpha = 1.0
+            self.beta = 1.0
+        else:
+            print("Loading optimizer state dict...")  
+            self.optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint_data:
+                self.scheduler.load_state_dict(checkpoint_data['scheduler_state_dict'])
+                print("Loading scheduler state dict...")
+            
+            # Restore loss balancing variables
+            self.ema_loss_A = checkpoint_data.get('ema_loss_A', None)
+            self.ema_loss_B = checkpoint_data.get('ema_loss_B', None)
+            self.alpha = checkpoint_data.get('alpha', 1.0)
+            self.beta = checkpoint_data.get('beta', 1.0)
         
         def _fmt_val(x):
             try:
@@ -573,12 +599,17 @@ class Trainer:
             )
             teacher_logits_B = teacher_outputs_B.logits[:, :-1, :].float()
             
-            # Apply temperature and compute soft targets
-            teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
-            teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
-            
-            # Average the teacher distributions: P_target = 0.5 * P_A + 0.5 * P_B
-            target_probs = 0.5 * teacher_probs_A + 0.5 * teacher_probs_B
+            if self.distillation_type == 'kl_geodesic':
+                # Average the teacher logits first (corresponds to KL geodesic): L_target = 0.5 * L_A + 0.5 * L_B
+                target_logits = 0.5 * teacher_logits_A + 0.5 * teacher_logits_B
+                target_probs = F.softmax(target_logits / self.distillation_temperature, dim=-1)
+            else: # 'naive_average'
+                # Apply temperature and compute soft targets
+                teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
+                teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+                
+                # Average the teacher distributions: P_target = 0.5 * P_A + 0.5 * P_B
+                target_probs = 0.5 * teacher_probs_A + 0.5 * teacher_probs_B
             
             # Move target probs back to student device
             target_probs = target_probs.to(self.device)
@@ -676,6 +707,9 @@ class Trainer:
             # Log changes
             optimizer_step = (step + 1) // self.gradient_accumulation_steps
             self.logger.log_config_change(optimizer_step, changes)
+
+            if "grad_clip" in changes:
+                self.grad_clip = self.live_config["grad_clip"]
         
         # Update intervals from live config
         self.log_interval = self.live_config.get("log_interval", self.log_interval)
@@ -737,11 +771,16 @@ class Trainer:
         data_iter = iter(self.dataloader)
         
         # Fast-forward dataloader if resuming
-        if self.resume_step > 0:
+        if self.resume_num_samples > 0:
             self._fast_forward_dataloader(data_iter)
         
+        # Calculate starting optimizer step based on samples seen
+        batch_size = self.dataloader.batch_size // 2  # Actual input examples per batch
+        effective_batch_size = batch_size * self.gradient_accumulation_steps
+        starting_optimizer_step = self.num_samples_seen // effective_batch_size
+        
         # Initial generation samples
-        if self.rank == 0:
+        if self.rank == 0 and starting_optimizer_step == 0:
             print(f"\n{'='*80}")
             print("Initial generation samples (step 0 - before training)")
             print('='*80)
@@ -749,6 +788,16 @@ class Trainer:
         
         # Log initial hyperparameters
         if self.rank == 0:
+            if self.in_resume_warmup:
+                print(f"\n{'='*80}")
+                print(f"RESUME WARMUP ENABLED")
+                print(f"{'='*80}")
+                print(f"Warmup steps: {self.resume_warmup_steps}")
+                print(f"Warmup LR factor: {self.resume_warmup_lr_factor}")
+                print(f"Base LR: {self.learning_rate}")
+                print(f"Warmup LR: {self.learning_rate * self.resume_warmup_lr_factor}")
+                print(f"{'='*80}\n")
+            
             self.logger.log_initial_hyperparams(
                 self.live_config, self.alpha, self.beta, 
                 self.objective, self.use_loss_balancing,
@@ -770,27 +819,62 @@ class Trainer:
         
         num_optimizer_steps = self.num_train_steps // self.gradient_accumulation_steps
         
-        # Progress bar
+        # Progress bar (use optimizer steps for display)
         pbar = None
         if self.rank == 0:
-            pbar = tqdm(range(self.resume_step, self.num_train_steps), 
-                        initial=self.resume_step, 
-                        total=self.num_train_steps, 
-                        desc="Training Steps")
-        else:
-            pbar = range(self.resume_step, self.num_train_steps)
+            pbar = tqdm(range(starting_optimizer_step, num_optimizer_steps), 
+                        initial=starting_optimizer_step, 
+                        total=num_optimizer_steps, 
+                        desc="Optimizer Steps")
         
-        for step in pbar:
+        # Microbatch step counter (for gradient accumulation)
+        microbatch_step = 0
+        
+        # Main training loop - iterate until we reach the target number of optimizer steps
+        while True:
+            # Calculate current optimizer step
+            current_optimizer_step = self.num_samples_seen // effective_batch_size
+            
+            # Check if we've reached the target
+            if current_optimizer_step >= num_optimizer_steps:
+                break
+            # Get next batch
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(self.dataloader)
                 batch = next(data_iter)
             
+            # Update samples seen counter
+            self.num_samples_seen += batch_size
+            microbatch_step += 1
+            
+            # Calculate current optimizer step
+            optimizer_step = self.num_samples_seen // effective_batch_size
+            
+            # Apply resume warmup LR if needed
+            if self.in_resume_warmup and optimizer_step < starting_optimizer_step + self.resume_warmup_steps:
+                warmup_progress = (optimizer_step - starting_optimizer_step) / self.resume_warmup_steps
+                current_lr_factor = self.resume_warmup_lr_factor + (1.0 - self.resume_warmup_lr_factor) * warmup_progress
+                
+                # Adjust learning rate for all param groups
+                for param_group in self.optimizer.param_groups:
+                    if 'base_lr' not in param_group:
+                        param_group['base_lr'] = param_group['lr']
+                    param_group['lr'] = param_group['base_lr'] * current_lr_factor
+            elif self.in_resume_warmup and optimizer_step >= starting_optimizer_step + self.resume_warmup_steps:
+                # Warmup complete - restore original LRs
+                self.in_resume_warmup = False
+                for param_group in self.optimizer.param_groups:
+                    if 'base_lr' in param_group:
+                        param_group['lr'] = param_group['base_lr']
+                if self.rank == 0:
+                    print(f"\nResume warmup complete at optimizer step {optimizer_step}!\n")
+            
             # Compute loss based on objective
             if self.objective == 'separate':
                 loss_A, loss_B, loss_same, loss_diff = self._compute_loss_separate(batch)
-                self.alpha, self.beta = self._update_loss_balancing_coefficients(step)
+                self.alpha, self.beta = self._update_loss_balancing_coefficients(optimizer_step)
                 loss = self.alpha * loss_A + self.beta * loss_B
             elif self.objective == 'averaged':
                 loss, loss_A, loss_same, loss_diff = self._compute_loss_averaged(batch)
@@ -811,7 +895,7 @@ class Trainer:
             
             # Non-finite loss guard
             if not torch.isfinite(loss):
-                self._handle_nonfinite_loss(step, batch, loss)
+                self._handle_nonfinite_loss(optimizer_step, batch, loss)
             
             if self.gradient_accumulation_steps > 1:
                 loss = loss / self.gradient_accumulation_steps
@@ -831,17 +915,20 @@ class Trainer:
                 loss_diff_acc_log += loss_diff.item()
                 num_diff_batches += 1
             
-            # Optimizer step
-            if (step + 1) % self.gradient_accumulation_steps == 0:
-                optimizer_step = (step + 1) // self.gradient_accumulation_steps
+            # Optimizer step (when gradient accumulation is complete)
+            if microbatch_step % self.gradient_accumulation_steps == 0:
                 
                 # Gradient clipping
                 grad_norm_value = self._clip_gradients()
                 if grad_norm_value is not None and self.rank == 0:
-                    self._check_gradient_norm(optimizer_step, grad_norm_value, step, batch)
+                    self._check_gradient_norm(optimizer_step, grad_norm_value, optimizer_step, batch)
                 
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+                
+                # Update progress bar
+                if self.rank == 0 and pbar is not None:
+                    pbar.update(1)
                 
                 # Accumulate loss for scheduler
                 avg_loss_for_step = total_loss_acc_log if self.gradient_accumulation_steps == 1 else total_loss_acc_log * self.gradient_accumulation_steps / self.gradient_accumulation_steps
@@ -849,7 +936,7 @@ class Trainer:
                 scheduler_steps_acc += 1
                 
                 # Check for live config changes
-                self._check_and_apply_config_changes(step)
+                self._check_and_apply_config_changes(optimizer_step)
                 
                 # Logging
                 if self.rank == 0 and optimizer_step % self.log_interval == 0:
@@ -885,9 +972,9 @@ class Trainer:
                     # Generate samples
                     self._generate_and_log_samples(optimizer_step)
                 
-                # Checkpointing
+                # Checkpointing (save with optimizer_step but track samples)
                 if self.rank == 0 and optimizer_step > 0 and optimizer_step % self.save_interval == 0:
-                    self._save_checkpoint(step + 1)
+                    self._save_checkpoint(optimizer_step)
         
         # Training complete
         if self.rank == 0:
@@ -896,20 +983,31 @@ class Trainer:
             print("Training completed!")
     
     def _fast_forward_dataloader(self, data_iter):
-        """Fast-forward dataloader to resume position."""
+        """Fast-forward dataloader to resume position by skipping samples."""
         try:
-            print(f"[Rank {self.rank}] Fast-forwarding dataloader by {self.resume_step} batches to resume position...")
+            if self.resume_num_samples == 0:
+                print(f"[Rank {self.rank}] No fast-forward needed (starting from beginning).")
+                return
+            
+            # Calculate how many batches to skip
+            # Note: DualStreamCollator creates 2 samples per input, so actual_batch_size = batch_size * 2
+            # But we want to count unique input examples, not the dual-stream pairs
+            # Each batch processes batch_size input examples (which become batch_size*2 training pairs)
+            batch_size = self.dataloader.batch_size // 2  # Divide by 2 because collator doubles it
+            num_batches_to_skip = self.resume_num_samples // batch_size
+            
+            print(f"[Rank {self.rank}] Fast-forwarding dataloader by {num_batches_to_skip} batches ({self.resume_num_samples} samples) to resume position...")
             if self.rank == 0:
-                ffbar = tqdm(range(self.resume_step), desc=f"Fast-forward dataloader (rank {self.rank})")
+                ffbar = tqdm(range(num_batches_to_skip), desc=f"Fast-forward dataloader (rank {self.rank})")
             else:
-                ffbar = range(self.resume_step)
+                ffbar = range(num_batches_to_skip)
             for _ in ffbar:
                 try:
                     _ = next(data_iter)
                 except StopIteration:
                     data_iter = iter(self.dataloader)
                     _ = next(data_iter)
-            print(f"[Rank {self.rank}] Fast-forward complete. Resuming training from step {self.resume_step}.")
+            print(f"[Rank {self.rank}] Fast-forward complete. Resuming training from sample {self.resume_num_samples}.")
         except Exception as e:
             print(f"[Rank {self.rank}] Warning: failed to fast-forward dataloader ({e}).")
     
@@ -917,9 +1015,9 @@ class Trainer:
         """Clip gradients and return gradient norm."""
         try:
             if isinstance(self.model, FSDP):
-                return FSDP.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                return FSDP.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
             else:
-                return torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                return torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
         except Exception:
             return None
     
@@ -1028,6 +1126,7 @@ class Trainer:
         self.checkpoint_manager.save_checkpoint(
             step, state_dict, self.optimizer.state_dict(),
             self.scheduler.state_dict(), self.alpha, self.beta,
-            self.ema_loss_A, self.ema_loss_B
+            self.ema_loss_A, self.ema_loss_B,
+            num_samples_seen=self.num_samples_seen
         )
 
