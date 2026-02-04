@@ -17,6 +17,7 @@ def load_checkpoint(checkpoint_path, model_name, device):
     model = DualStreamLLM(
         model_name=model_name,
         freeze_backbone=True,
+        optimize_memory=True,  # Match training config to avoid lm_head issues
         embedding_init_strategy='copy',
         objective='distillation',
         shared_embeddings=True
@@ -86,6 +87,25 @@ def generate_with_separator(
     tokens_a = tokenizer.encode(prompt_a, return_tensors='pt').to(device)
     tokens_b = tokenizer.encode(prompt_b, return_tensors='pt').to(device)
     
+    len_a = tokens_a.shape[1]
+    len_b = tokens_b.shape[1]
+    
+    if len_a != len_b:
+        min_len = min(len_a, len_b)
+        print(f"\n[INFO] Prompts have different lengths (A: {len_a}, B: {len_b}). Truncating to {min_len} tokens for balance.")
+        
+        if len_a > min_len:
+            truncated_tokens = tokens_a[:, :min_len]
+            truncated_text = tokenizer.decode(truncated_tokens[0], skip_special_tokens=True)
+            print(f"Truncated Prompt A: \"{prompt_a}\" -> \"{truncated_text}\"")
+            tokens_a = truncated_tokens
+            
+        if len_b > min_len:
+            truncated_tokens = tokens_b[:, :min_len]
+            truncated_text = tokenizer.decode(truncated_tokens[0], skip_special_tokens=True)
+            print(f"Truncated Prompt B: \"{prompt_b}\" -> \"{truncated_text}\"")
+            tokens_b = truncated_tokens
+
     print(f"\n{'='*80}")
     print(f"GENERATION WITH SEPARATOR MODEL")
     print(f"{'='*80}")
@@ -162,16 +182,34 @@ def generate_with_separator(
             if (step + 1) % 10 == 0:
                 print(f"Generated {step + 1}/{max_new_tokens} tokens...")
     
-    # Decode results
-    generated_a = tokenizer.decode(tokens_a[0], skip_special_tokens=True)
-    generated_b = tokenizer.decode(tokens_b[0], skip_special_tokens=True)
+    # Decode results with coloring
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+    
+    def get_colored_text(full_tokens, prompt_len):
+        # Decode the full sequence
+        full_text = tokenizer.decode(full_tokens, skip_special_tokens=True)
+        # Decode only the prompt part
+        prompt_text = tokenizer.decode(full_tokens[:prompt_len], skip_special_tokens=True)
+        
+        # Find where prompt ends and generation begins in the full text string
+        if full_text.startswith(prompt_text):
+            gen_text = full_text[len(prompt_text):]
+            return f"{BLUE}{prompt_text}{RESET}{gen_text}", full_text
+        else:
+            # Fallback for weird edge cases in decoding
+            gen_text = tokenizer.decode(full_tokens[prompt_len:], skip_special_tokens=True)
+            return f"{BLUE}{prompt_text}{RESET} {gen_text}", full_text
+
+    colored_a, generated_a = get_colored_text(tokens_a[0], len_a if 'min_len' not in locals() else min_len)
+    colored_b, generated_b = get_colored_text(tokens_b[0], len_b if 'min_len' not in locals() else min_len)
     
     print(f"\n{'='*80}")
     print(f"RESULTS")
     print(f"{'='*80}")
-    print(f"\nText A:\n{generated_a}")
+    print(f"\nText A:\n{colored_a}")
     print(f"\n{'-'*80}")
-    print(f"\nText B:\n{generated_b}")
+    print(f"\nText B:\n{colored_b}")
     print(f"\n{'='*80}\n")
     
     return generated_a, generated_b

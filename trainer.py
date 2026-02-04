@@ -639,6 +639,25 @@ class Trainer:
         loss = loss * (self.distillation_temperature ** 2)
         loss_per_sample = loss_per_sample * (self.distillation_temperature ** 2)
         
+        # Compute per-stream losses for separate logging in distillation mode
+        # This measures how well student matches teacher A and B distributions separately
+        with torch.no_grad():
+            # Convert teacher logits to probabilities for individual streams
+            teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
+            teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+            
+            # Compute KL divergence between student and each teacher stream separately (for logging)
+            kl_div_A_per_pos = (teacher_probs_A * (torch.log(teacher_probs_A + 1e-10) - student_log_probs)).sum(dim=-1)
+            kl_div_B_per_pos = (teacher_probs_B * (torch.log(teacher_probs_B + 1e-10) - student_log_probs)).sum(dim=-1)
+            
+            # Per-sample loss for each stream
+            loss_A_per_sample = (kl_div_A_per_pos * valid_mask_float).sum(dim=1) / (valid_mask_float.sum(dim=1) + 1e-8)
+            loss_B_per_sample = (kl_div_B_per_pos * valid_mask_float).sum(dim=1) / (valid_mask_float.sum(dim=1) + 1e-8)
+            
+            # Average across batch and scale
+            loss_A_logging = loss_A_per_sample.mean() * (self.distillation_temperature ** 2)
+            loss_B_logging = loss_B_per_sample.mean() * (self.distillation_temperature ** 2)
+        
         # Compute separate losses for same_text and different_text cases
         loss_same = None
         loss_diff = None
@@ -655,7 +674,8 @@ class Trainer:
             if num_diff > 0:
                 loss_diff = (loss_per_sample * diff_mask).sum() / num_diff
         
-        return loss, loss, loss_same, loss_diff
+        # Return: (actual_loss_for_backprop, loss_A_for_logging, loss_B_for_logging, loss_same, loss_diff)
+        return loss, loss_A_logging, loss_B_logging, loss_same, loss_diff
     
     def _update_loss_balancing_coefficients(self, step: int):
         """Update alpha and beta coefficients for loss balancing."""
@@ -889,8 +909,7 @@ class Trainer:
                 self.alpha, self.beta = 1.0, 1.0
                 loss = self.alpha * loss_A + self.beta * loss_B
             elif self.objective == 'distillation':
-                loss, loss_A, loss_same, loss_diff = self._compute_loss_distillation(batch)
-                loss_B = loss_A
+                loss, loss_A, loss_B, loss_same, loss_diff = self._compute_loss_distillation(batch)
                 self.alpha, self.beta = 1.0, 1.0
             
             # Non-finite loss guard
@@ -1100,6 +1119,22 @@ class Trainer:
                 'Backbone LR': f"{current_backbone_lr:.2e}" if current_backbone_lr is not None else 'N/A',
                 'Alpha': f"{self.alpha:.4f}",
                 'Beta': f"{self.beta:.4f}",
+            }
+            if avg_loss_same is not None:
+                postfix_metrics['Same'] = f"{avg_loss_same:.4f}"
+            if avg_loss_diff is not None:
+                postfix_metrics['Diff'] = f"{avg_loss_diff:.4f}"
+            if pbar and hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix(postfix_metrics)
+        elif self.objective == 'distillation':
+            # For distillation, show loss A and B separately
+            postfix_metrics = {
+                'Opt Step': f"{optimizer_step}/{num_optimizer_steps}",
+                'Loss': f"{avg_total_loss:.4f}",
+                'Loss A': f"{avg_loss_A:.4f}",
+                'Loss B': f"{avg_loss_B:.4f}",
+                'LR': f"{current_lr:.2e}",
+                'Backbone LR': f"{current_backbone_lr:.2e}" if current_backbone_lr is not None else 'N/A',
             }
             if avg_loss_same is not None:
                 postfix_metrics['Same'] = f"{avg_loss_same:.4f}"
