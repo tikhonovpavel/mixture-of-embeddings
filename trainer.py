@@ -602,17 +602,23 @@ class Trainer:
             if self.distillation_type == 'kl_geodesic':
                 # Average the teacher logits first (corresponds to KL geodesic): L_target = 0.5 * L_A + 0.5 * L_B
                 target_logits = 0.5 * teacher_logits_A + 0.5 * teacher_logits_B
-                target_probs = F.softmax(target_logits / self.distillation_temperature, dim=-1)
+                target_log_probs = F.log_softmax(target_logits / self.distillation_temperature, dim=-1)
+                target_probs = target_log_probs.exp()
             else: # 'naive_average'
-                # Apply temperature and compute soft targets
-                teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
-                teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+                # Apply temperature and compute soft targets via log_softmax for stability
+                teacher_log_probs_A = F.log_softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
+                teacher_log_probs_B = F.log_softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
                 
                 # Average the teacher distributions: P_target = 0.5 * P_A + 0.5 * P_B
-                target_probs = 0.5 * teacher_probs_A + 0.5 * teacher_probs_B
+                # Compute log((P_A + P_B)/2) stably via logsumexp
+                # log((exp(log_A) + exp(log_B))/2) = logsumexp([log_A, log_B], dim=0) - log(2)
+                stacked_log_probs = torch.stack([teacher_log_probs_A, teacher_log_probs_B], dim=0)
+                target_log_probs = torch.logsumexp(stacked_log_probs, dim=0) - np.log(2.0)
+                target_probs = target_log_probs.exp()
             
-            # Move target probs back to student device
+            # Move to student device
             target_probs = target_probs.to(self.device)
+            target_log_probs = target_log_probs.to(self.device)
         
         # Get student predictions on mixed embeddings
         student_logits = self.model(input_ids_A, attention_mask_A, input_ids_B, attention_mask_B)
@@ -626,7 +632,8 @@ class Trainer:
         
         # Compute KL divergence: KL(target || student) = sum(target * log(target/student))
         # = sum(target * (log(target) - log(student)))
-        kl_div_per_pos = (target_probs * (torch.log(target_probs + 1e-10) - student_log_probs)).sum(dim=-1)
+        # Use target_log_probs for numerical stability
+        kl_div_per_pos = (target_probs * (target_log_probs - student_log_probs)).sum(dim=-1)
         
         # Per-sample loss
         valid_mask_float = valid_mask.float()
@@ -642,13 +649,15 @@ class Trainer:
         # Compute per-stream losses for separate logging in distillation mode
         # This measures how well student matches teacher A and B distributions separately
         with torch.no_grad():
-            # Convert teacher logits to probabilities for individual streams
-            teacher_probs_A = F.softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
-            teacher_probs_B = F.softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+            # Use log_softmax for numerical stability
+            teacher_log_probs_A = F.log_softmax(teacher_logits_A / self.distillation_temperature, dim=-1)
+            teacher_log_probs_B = F.log_softmax(teacher_logits_B / self.distillation_temperature, dim=-1)
+            teacher_probs_A = teacher_log_probs_A.exp()
+            teacher_probs_B = teacher_log_probs_B.exp()
             
             # Compute KL divergence between student and each teacher stream separately (for logging)
-            kl_div_A_per_pos = (teacher_probs_A * (torch.log(teacher_probs_A + 1e-10) - student_log_probs)).sum(dim=-1)
-            kl_div_B_per_pos = (teacher_probs_B * (torch.log(teacher_probs_B + 1e-10) - student_log_probs)).sum(dim=-1)
+            kl_div_A_per_pos = (teacher_probs_A * (teacher_log_probs_A - student_log_probs)).sum(dim=-1)
+            kl_div_B_per_pos = (teacher_probs_B * (teacher_log_probs_B - student_log_probs)).sum(dim=-1)
             
             # Per-sample loss for each stream
             loss_A_per_sample = (kl_div_A_per_pos * valid_mask_float).sum(dim=1) / (valid_mask_float.sum(dim=1) + 1e-8)

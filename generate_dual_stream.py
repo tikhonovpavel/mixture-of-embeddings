@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import fire
 import os
+from abc import ABC, abstractmethod
 
 from model import DualStreamLLM
 
@@ -34,6 +35,155 @@ def load_checkpoint(checkpoint_path, model_name, device):
     
     print(f"Model loaded successfully (step {checkpoint.get('step', 'unknown')})")
     return model
+
+
+# ============================================================================
+# DECONVOLUTION STRATEGIES
+# ============================================================================
+
+class DeconvolutionStrategy(ABC):
+    """Abstract base class for deconvolution strategies."""
+    
+    @abstractmethod
+    def generate(self, big_model, tokens_a, tokens_b, tokenizer, max_new_tokens, temperature):
+        """
+        Generate tokens using this strategy.
+        
+        Args:
+            big_model: The main model to use
+            tokens_a: Token IDs for stream A
+            tokens_b: Token IDs for stream B
+            tokenizer: Tokenizer
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            
+        Returns:
+            out_a: Generated tokens for stream A
+            out_b: Generated tokens for stream B
+        """
+        pass
+    
+    @abstractmethod
+    def get_config_string(self):
+        """Return a string describing this strategy for logging/visualization."""
+        pass
+
+
+class DualLinearStrategy(DeconvolutionStrategy):
+    """Dual-stream linear combination deconvolution strategy."""
+    
+    def __init__(self, separator_model, alpha=0.1, beta=0.1):
+        """
+        Args:
+            separator_model: Small model for separation signal
+            alpha: Weight for own stream logits
+            beta: Weight for other stream logits (subtracted)
+        """
+        self.separator_model = separator_model
+        self.alpha = alpha
+        self.beta = beta
+    
+    def generate(self, dual_stream_model, tokens_a, tokens_b, tokenizer, max_new_tokens, temperature):
+        """Generate using dual-stream linear combination."""
+        return generate_dual_linear(
+            dual_stream_model,
+            self.separator_model,
+            tokens_a,
+            tokens_b,
+            tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            alpha=self.alpha,
+            beta=self.beta
+        )
+    
+    def get_config_string(self):
+        """Return config string for logging."""
+        return f"DualLinear (α={self.alpha}, β={self.beta})"
+
+
+class EnsembleStrategy(DeconvolutionStrategy):
+    """Ensemble strategy: average log-probs from independent single-stream runs, then deconvolve with separator model.
+    
+    Math:
+        Averaging logits ≈ geometric mean of distributions: p_mix ∝ √(p_A · p_B).
+        To undo this and recover p_A:  p_A ∝ p_mix² / p_B,
+        which in log-space is:  ℓ_A = 2·ℓ_mix - ℓ_B.
+        
+        We work in log-probability space (log-softmax) to normalize scales
+        before averaging, so one confident prediction doesn't dominate.
+        
+        Soft version with γ ∈ [0, 1]:
+            ℓ_A = (1 + γ)·ℓ_mix - γ·sep_B
+            γ=1: full deconvolution,  γ=0: no deconvolution (just mixed logits)
+    
+    Pipeline:
+        1. Run big_model on text A alone → log_softmax(logits_A)
+        2. Run big_model on text B alone → log_softmax(logits_B)
+        3. Average in log-prob space: ℓ_mix = (log_p_A + log_p_B) / 2
+        4. Run separator_model on each text → log_softmax(sep_B), log_softmax(sep_A)
+        5. Deconvolve:
+            final_A = (1 + γ)·ℓ_mix - γ·sep_B
+            final_B = (1 + γ)·ℓ_mix - γ·sep_A
+    """
+    
+    def __init__(self, separator_model, gamma=1.0):
+        """
+        Args:
+            separator_model: Small model for providing separation signal
+            gamma: Deconvolution strength. 1.0 = full deconvolution, 0.0 = no deconvolution
+        """
+        self.separator_model = separator_model
+        self.gamma = gamma
+    
+    def generate(self, big_model, tokens_a, tokens_b, tokenizer, max_new_tokens, temperature):
+        """Generate using ensemble of independent runs + separator deconvolution."""
+        return generate_ensemble_linear(
+            big_model,
+            self.separator_model,
+            tokens_a,
+            tokens_b,
+            tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            gamma=self.gamma
+        )
+    
+    def get_config_string(self):
+        """Return config string for logging."""
+        return f"Ensemble (log-prob avg → deconv γ={self.gamma})"
+
+
+class SingleModelStrategy(DeconvolutionStrategy):
+    """Baseline strategy: run a single model independently on each text (no mixing, no deconvolution).
+    
+    Used to measure baseline performance of a small model on LAMBADA.
+    """
+    
+    def __init__(self, model):
+        """
+        Args:
+            model: Model to use (typically a small/separator model for baseline)
+        """
+        self.model = model
+    
+    def generate(self, big_model, tokens_a, tokens_b, tokenizer, max_new_tokens, temperature):
+        """Generate using single model independently on each text.
+        
+        Note: big_model parameter is ignored, self.model is used instead.
+        """
+        return generate_single_model(
+            self.model,
+            tokens_a,
+            tokens_b,
+            tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature
+        )
+    
+    def get_config_string(self):
+        """Return config string for logging."""
+        return "SingleModel (baseline, no mixing)"
 
 
 @torch.no_grad()
@@ -82,12 +232,10 @@ def get_dual_logits(
     mixed_logits_next = mixed_logits[:, -1, :]  # [batch, vocab_size]
     
     # Get logits from separator model for text A
-    sep_outputs_a = separator_model(tokens_a)
-    sep_logits_a = sep_outputs_a.logits[:, -1, :]  # [batch, vocab_size]
+    sep_logits_a = get_single_logits(separator_model, tokens_a, tokenizer)
     
     # Get logits from separator model for text B
-    sep_outputs_b = separator_model(tokens_b)
-    sep_logits_b = sep_outputs_b.logits[:, -1, :]  # [batch, vocab_size]
+    sep_logits_b = get_single_logits(separator_model, tokens_b, tokenizer)
     
     # Create masks based on top-K tokens from separator model
     topk_a = torch.topk(sep_logits_a, k=top_k_mask, dim=-1)
@@ -160,12 +308,10 @@ def get_dual_logits_linear(
     mixed_logits_next = mixed_logits[:, -1, :]  # [batch, vocab_size]
     
     # Get logits from separator model for text A
-    sep_outputs_a = separator_model(tokens_a)
-    sep_logits_a = sep_outputs_a.logits[:, -1, :]  # [batch, vocab_size]
+    sep_logits_a = get_single_logits(separator_model, tokens_a, tokenizer)
     
     # Get logits from separator model for text B
-    sep_outputs_b = separator_model(tokens_b)
-    sep_logits_b = sep_outputs_b.logits[:, -1, :]  # [batch, vocab_size]
+    sep_logits_b = get_single_logits(separator_model, tokens_b, tokenizer)
     
     # Apply linear combination
     # logits_A = logits_mixed + alpha * logits_small(A) - beta * logits_small(B)
@@ -250,6 +396,205 @@ def generate_dual_linear(
         tokens_a = torch.cat([tokens_a, next_token_a], dim=1)
         tokens_b = torch.cat([tokens_b, next_token_b], dim=1)
         
+    return tokens_a, tokens_b
+
+
+# ============================================================================
+# ENSEMBLE FUNCTIONS
+# ============================================================================
+
+@torch.no_grad()
+def get_single_logits(
+    big_model,
+    tokens,
+    tokenizer
+):
+    """
+    Get logits for a single stream/text.
+    
+    Args:
+        big_model: The model to use (can be DualStreamLLM or any causal LM)
+        tokens: Token IDs [batch, seq_len]
+        tokenizer: Tokenizer
+        
+    Returns:
+        logits: Next token logits [batch, vocab_size]
+    """
+    # Prepare inputs
+    attention_mask = (tokens != tokenizer.pad_token_id).long()
+    
+    # Forward pass
+    if hasattr(big_model, 'forward') and 'input_ids_A' in big_model.forward.__code__.co_varnames:
+        # DualStreamLLM - use it in single-stream mode (both streams same)
+        output = big_model(
+            input_ids_A=tokens,
+            attention_mask_A=attention_mask,
+            input_ids_B=tokens,
+            attention_mask_B=attention_mask
+        )
+    else:
+        # Regular causal LM
+        output = big_model(input_ids=tokens, attention_mask=attention_mask)
+    
+    # Get logits for next token (last position)
+    logits = output.logits[:, -1, :] if hasattr(output, 'logits') else output[:, -1, :]
+    
+    return logits
+
+
+@torch.no_grad()
+def generate_single_model(
+    model,
+    tokens_a,
+    tokens_b,
+    tokenizer,
+    max_new_tokens=1,
+    temperature=0.7
+):
+    """
+    Generate tokens for both texts independently using a single model.
+    No mixing, no deconvolution - just baseline performance.
+    
+    Args:
+        model: Model to use (any causal LM)
+        tokens_a: Token IDs for text A [batch, seq_len]
+        tokens_b: Token IDs for text B [batch, seq_len]
+        tokenizer: Tokenizer
+        max_new_tokens: Number of tokens to generate
+        temperature: Sampling temperature
+        
+    Returns:
+        tokens_a: Generated sequence for A [batch, seq_len + max_new_tokens]
+        tokens_b: Generated sequence for B [batch, seq_len + max_new_tokens]
+    """
+    for _ in range(max_new_tokens):
+        # Get logits independently for each text
+        logits_a = get_single_logits(model, tokens_a, tokenizer)
+        logits_b = get_single_logits(model, tokens_b, tokenizer)
+        
+        # Apply temperature and sample
+        probs_a = F.softmax(logits_a / temperature, dim=-1)
+        probs_b = F.softmax(logits_b / temperature, dim=-1)
+        
+        next_token_a = torch.multinomial(probs_a, num_samples=1)
+        next_token_b = torch.multinomial(probs_b, num_samples=1)
+        
+        tokens_a = torch.cat([tokens_a, next_token_a], dim=1)
+        tokens_b = torch.cat([tokens_b, next_token_b], dim=1)
+    
+    return tokens_a, tokens_b
+
+
+@torch.no_grad()
+def get_ensemble_logits_linear(
+    big_model,
+    separator_model,
+    tokens_a,
+    tokens_b,
+    tokenizer,
+    gamma=1.0
+):
+    """
+    Get deconvolved logits by averaging log-probs from independent runs, then subtracting the other stream.
+    
+    Math (in log-probability space):
+        log_p_mix = (log_p_A + log_p_B) / 2      ← geometric mean
+        log_p_A_recovered = (1 + γ)·log_p_mix - γ·log_p_B_sep
+        
+        At γ=1: log_p_A = 2·log_p_mix - log_p_B  ← exact deconvolution
+        At γ=0: log_p_A = log_p_mix               ← no deconvolution
+    
+    Uses log-softmax to normalize scales before averaging, so one confident 
+    prediction doesn't dominate the other.
+    
+    Args:
+        big_model: Model to use (DualStreamLLM or any causal LM)
+        separator_model: Small model for providing separation signal
+        tokens_a: Token IDs for text A [batch, seq_len]
+        tokens_b: Token IDs for text B [batch, seq_len]
+        tokenizer: Tokenizer
+        gamma: Deconvolution strength (1.0 = full, 0.0 = none)
+        
+    Returns:
+        final_logits_a: Deconvolved logits for stream A [batch, vocab_size]
+        final_logits_b: Deconvolved logits for stream B [batch, vocab_size]
+    """
+    # Get logits from big model for each text independently
+    logits_a = get_single_logits(big_model, tokens_a, tokenizer)
+    logits_b = get_single_logits(big_model, tokens_b, tokenizer)
+    
+    # Convert to log-probabilities to normalize scales
+    log_probs_a = F.log_softmax(logits_a, dim=-1)
+    log_probs_b = F.log_softmax(logits_b, dim=-1)
+    
+    # Average in log-prob space (= geometric mean of distributions)
+    log_probs_mixed = (log_probs_a + log_probs_b) / 2.0
+    
+    # Get separator model log-probs for each text
+    # Use get_single_logits to handle both regular LMs and DualStreamLLM
+    sep_logits_a = get_single_logits(separator_model, tokens_a, tokenizer)
+    sep_log_probs_a = F.log_softmax(sep_logits_a, dim=-1)
+    
+    sep_logits_b = get_single_logits(separator_model, tokens_b, tokenizer)
+    sep_log_probs_b = F.log_softmax(sep_logits_b, dim=-1)
+    
+    # Deconvolve: ℓ_A = (1 + γ)·ℓ_mix - γ·sep_B
+    final_logits_a = (1.0 + gamma) * log_probs_mixed - gamma * sep_log_probs_b
+    final_logits_b = (1.0 + gamma) * log_probs_mixed - gamma * sep_log_probs_a
+    
+    return final_logits_a, final_logits_b
+
+
+@torch.no_grad()
+def generate_ensemble_linear(
+    big_model,
+    separator_model,
+    tokens_a,
+    tokens_b,
+    tokenizer,
+    max_new_tokens=1,
+    temperature=0.7,
+    gamma=1.0
+):
+    """
+    Generate tokens for both streams using ensemble + separator deconvolution.
+    
+    At each step:
+        1. Run big_model independently on A and B
+        2. Average log-probs (geometric mean of distributions)
+        3. Deconvolve using separator_model: ℓ_A = (1+γ)·ℓ_mix - γ·sep_B
+        4. Sample next tokens
+    
+    Args:
+        big_model: Model to use for generation
+        separator_model: Small model for separation signal
+        tokens_a: Token IDs for text A [batch, seq_len]
+        tokens_b: Token IDs for text B [batch, seq_len]
+        tokenizer: Tokenizer
+        max_new_tokens: Number of tokens to generate
+        temperature: Sampling temperature
+        gamma: Deconvolution strength (1.0 = full, 0.0 = none)
+        
+    Returns:
+        tokens_a: Generated sequence for A [batch, seq_len + max_new_tokens]
+        tokens_b: Generated sequence for B [batch, seq_len + max_new_tokens]
+    """
+    for _ in range(max_new_tokens):
+        logits_a, logits_b = get_ensemble_logits_linear(
+            big_model, separator_model, tokens_a, tokens_b, tokenizer,
+            gamma=gamma
+        )
+        
+        # Apply temperature and sample
+        probs_a = F.softmax(logits_a / temperature, dim=-1)
+        probs_b = F.softmax(logits_b / temperature, dim=-1)
+        
+        next_token_a = torch.multinomial(probs_a, num_samples=1)
+        next_token_b = torch.multinomial(probs_b, num_samples=1)
+        
+        tokens_a = torch.cat([tokens_a, next_token_a], dim=1)
+        tokens_b = torch.cat([tokens_b, next_token_b], dim=1)
+    
     return tokens_a, tokens_b
 
 

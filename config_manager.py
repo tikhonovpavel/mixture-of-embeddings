@@ -32,6 +32,7 @@ class ConfigManager:
         log_interval: int,
         similarity_log_interval: int,
         eval_interval: int,
+        grad_clip: float,
         loss_balance_strength: float,
         loss_balance_ema_momentum: float,
         loss_balance_clip_min: float,
@@ -45,6 +46,7 @@ class ConfigManager:
             "log_interval": log_interval,
             "similarity_log_interval": similarity_log_interval,
             "eval_interval": eval_interval,
+            "grad_clip": grad_clip,
             "loss_balance_strength": loss_balance_strength,
             "loss_balance_ema_momentum": loss_balance_ema_momentum,
             "loss_balance_clip_min": loss_balance_clip_min,
@@ -92,6 +94,13 @@ class ConfigManager:
             new_temp = new_config["temperature"]
             current_config["temperature"] = new_temp
             changes["temperature"] = (old_temp, new_temp)
+
+        # Check and apply grad_clip changes
+        if "grad_clip" in new_config and new_config["grad_clip"] != current_config.get("grad_clip", 1.0):
+            old_val = current_config.get("grad_clip", 1.0)
+            new_val = new_config["grad_clip"]
+            current_config["grad_clip"] = new_val
+            changes["grad_clip"] = (old_val, new_val)
         
         # Check and apply loss balance parameter changes
         for param_name in ["loss_balance_strength", "loss_balance_ema_momentum", 

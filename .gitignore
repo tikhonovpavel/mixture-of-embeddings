@@ -5,3 +5,5 @@ tensorboard_logs/
 logs/
 
 RESULT_FOLDER
+analyze_lambada.ipynb
+lambada_test_filtered.jsonl

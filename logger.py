@@ -222,6 +222,16 @@ class TrainingLogger:
                 
                 if ema_loss_A is not None and ema_loss_B is not None:
                     self.writer.add_scalar('loss_balance/losses_ratio', ema_loss_A / ema_loss_B if ema_loss_B > 0 else 0, step)
+        elif objective == 'distillation':
+            # Log separate stream losses for distillation
+            if loss_A is not None:
+                self.writer.add_scalar('train/loss_A', loss_A, step)
+            if loss_B is not None:
+                self.writer.add_scalar('train/loss_B', loss_B, step)
+            
+            # Log ratio of stream losses
+            if loss_A is not None and loss_B is not None:
+                self.writer.add_scalar('train/loss_A_B_ratio', loss_A / loss_B if loss_B > 0 else 0, step)
         
         self.writer.flush()
     
