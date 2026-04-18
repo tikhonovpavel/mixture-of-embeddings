@@ -1,0 +1,106 @@
+[run] model=Qwen/Qwen2.5-3B
+[run] num_pairs=100  T=128
+[run] saving to experiments/attention_patching/results/patch_Qwen_Qwen2.5-3B_N100_T128_20260417_144709.{parquet,json}
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/434 [00:00<?, ?it/s]Loading weights:   0%|          | 1/434 [00:00<00:58,  7.39it/s]Loading weights:   6%|▋         | 28/434 [00:00<00:02, 136.37it/s]Loading weights:  14%|█▎        | 59/434 [00:00<00:01, 206.55it/s]Loading weights:  20%|██        | 88/434 [00:00<00:01, 229.35it/s]Loading weights:  27%|██▋       | 119/434 [00:00<00:01, 255.72it/s]Loading weights:  34%|███▎      | 146/434 [00:00<00:01, 256.09it/s]Loading weights:  42%|████▏     | 183/434 [00:00<00:00, 272.84it/s]Loading weights:  50%|█████     | 218/434 [00:00<00:00, 277.41it/s]Loading weights:  58%|█████▊    | 253/434 [00:01<00:00, 297.88it/s]Loading weights:  65%|██████▌   | 284/434 [00:01<00:00, 286.54it/s]Loading weights:  73%|███████▎  | 315/434 [00:01<00:00, 283.49it/s]Loading weights:  81%|████████  | 351/434 [00:01<00:00, 295.80it/s]Loading weights:  88%|████████▊ | 381/434 [00:01<00:00, 289.58it/s]Loading weights:  95%|█████████▍| 412/434 [00:01<00:00, 289.65it/s]Loading weights: 100%|██████████| 434/434 [00:01<00:00, 267.66it/s]
+[data] streaming HuggingFaceFW/fineweb-edu/sample-10BT ...
+[data] got 450 raw texts; tokenizing to T=128
+[run] pair 5/100 (5.0%)  elapsed=56.9s  eta=1081.9s
+[run] pair 10/100 (10.0%)  elapsed=111.6s  eta=1004.8s
+[run] pair 15/100 (15.0%)  elapsed=163.2s  eta=924.6s
+[run] pair 20/100 (20.0%)  elapsed=221.4s  eta=885.7s
+[run] pair 25/100 (25.0%)  elapsed=277.2s  eta=831.5s
+[run] pair 30/100 (30.0%)  elapsed=329.1s  eta=767.9s
+[run] pair 35/100 (35.0%)  elapsed=381.0s  eta=707.6s
+[run] pair 40/100 (40.0%)  elapsed=434.1s  eta=651.1s
+[run] pair 45/100 (45.0%)  elapsed=488.3s  eta=596.8s
+[run] pair 50/100 (50.0%)  elapsed=539.6s  eta=539.6s
+[run] pair 55/100 (55.0%)  elapsed=594.2s  eta=486.1s
+[run] pair 60/100 (60.0%)  elapsed=647.2s  eta=431.5s
+[run] pair 65/100 (65.0%)  elapsed=698.0s  eta=375.9s
+[run] pair 70/100 (70.0%)  elapsed=749.3s  eta=321.1s
+[run] pair 75/100 (75.0%)  elapsed=803.2s  eta=267.7s
+[run] pair 80/100 (80.0%)  elapsed=862.1s  eta=215.5s
+[run] pair 85/100 (85.0%)  elapsed=919.8s  eta=162.3s
+[run] pair 90/100 (90.0%)  elapsed=977.4s  eta=108.6s
+[run] pair 95/100 (95.0%)  elapsed=1033.0s  eta=54.4s
+[run] pair 100/100 (100.0%)  elapsed=1085.7s  eta=0.0s
+[run] wrote experiments/attention_patching/results/patch_Qwen_Qwen2.5-3B_N100_T128_20260417_144709.parquet  (12700 rows)
+[run] wrote experiments/attention_patching/results/patch_Qwen_Qwen2.5-3B_N100_T128_20260417_144709.json
+{
+  "model_name": "Qwen/Qwen2.5-3B",
+  "num_pairs": 100,
+  "max_length": 128,
+  "seed": 42,
+  "wasserstein_k": 256,
+  "skip_wasserstein": false,
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "dataset_name": "sample-10BT",
+  "n_rows": 12700,
+  "rank_top1_a1_in_a2": {
+    "mean": 948.4383464566929,
+    "median": 8.0,
+    "std": 6454.755628331287
+  },
+  "kl_a1_a2": {
+    "mean": 3.5395191237530224,
+    "median": 3.0034725666046143,
+    "std": 2.327791427415242
+  },
+  "js_a1_a2": {
+    "mean": 0.46854681341787874,
+    "median": 0.4869374781847,
+    "std": 0.14911772428926026
+  },
+  "tvd_a1_a2": {
+    "mean": 0.8004681990757827,
+    "median": 0.8387459516525269,
+    "std": 0.16740605238317352
+  },
+  "kl_a1_aprime": {
+    "mean": 13.095507244343363,
+    "median": 12.638492584228516,
+    "std": 5.114174785720351
+  },
+  "js_a1_aprime": {
+    "mean": 0.6654919587874301,
+    "median": 0.6880661249160767,
+    "std": 0.06608289767741757
+  },
+  "tvd_a1_aprime": {
+    "mean": 0.9774585320364948,
+    "median": 0.997026264667511,
+    "std": 0.06725232020600934
+  },
+  "entropy_a1": {
+    "mean": 2.2366100626823457,
+    "median": 2.123962163925171,
+    "std": 1.5761650029594458
+  },
+  "entropy_a2": {
+    "mean": 6.260961830030437,
+    "median": 6.483175039291382,
+    "std": 1.4231089884063408
+  },
+  "wasserstein_a1_a2": {
+    "mean": 0.6562965811761449,
+    "median": 0.6557795989132962,
+    "std": 0.21996582130451736
+  },
+  "wasserstein_a1_aprime": {
+    "mean": 0.9002702518069178,
+    "median": 0.9438030512516271,
+    "std": 0.14312576519781778
+  },
+  "rank_cdf": {
+    "1": 0.23094488188976378,
+    "5": 0.44661417322834646,
+    "10": 0.5291338582677165,
+    "50": 0.6884251968503937,
+    "100": 0.7423622047244095
+  },
+  "R_kl": 0.27028499604564205,
+  "R_js": 0.7040608188138017,
+  "R_tvd": 0.8189280392366518,
+  "R_wasserstein": 0.7289995197096679
+}

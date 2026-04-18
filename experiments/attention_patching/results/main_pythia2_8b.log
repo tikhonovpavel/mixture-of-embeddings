@@ -1,0 +1,8 @@
+[run] model=EleutherAI/pythia-2.8b
+[run] num_pairs=1000  T=128
+[run] saving to experiments/attention_patching/results/patch_EleutherAI_pythia-2.8b_N1000_T128_20260417_143416.{parquet,json}
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/388 [00:00<?, ?it/s]Loading weights:   7%|▋         | 26/388 [00:00<00:01, 237.16it/s]Loading weights:  14%|█▍        | 56/388 [00:00<00:01, 254.45it/s]Loading weights:  22%|██▏       | 84/388 [00:00<00:01, 236.26it/s]Loading weights:  30%|██▉       | 116/388 [00:00<00:01, 261.06it/s]Loading weights:  37%|███▋      | 143/388 [00:00<00:00, 258.38it/s]Loading weights:  44%|████▍     | 170/388 [00:00<00:00, 236.05it/s]Loading weights:  53%|█████▎    | 204/388 [00:00<00:00, 239.93it/s]Loading weights:  62%|██████▏   | 240/388 [00:00<00:00, 255.44it/s]Loading weights:  70%|███████   | 272/388 [00:01<00:00, 260.71it/s]Loading weights:  77%|███████▋  | 300/388 [00:01<00:00, 264.30it/s]Loading weights:  84%|████████▍ | 327/388 [00:01<00:00, 250.87it/s]Loading weights:  93%|█████████▎| 360/388 [00:01<00:00, 249.05it/s]Loading weights: 100%|██████████| 388/388 [00:01<00:00, 253.28it/s]
+[data] streaming HuggingFaceFW/fineweb-edu/sample-10BT ...
+[data] got 4500 raw texts; tokenizing to T=128
+[run] pair 50/1000 (5.0%)  elapsed=490.7s  eta=9324.2s

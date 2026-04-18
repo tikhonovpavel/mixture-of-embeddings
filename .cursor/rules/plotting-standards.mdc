@@ -1,0 +1,50 @@
+---
+description: Standards for creating accessible, colorblind-friendly plots (Matplotlib/Seaborn)
+alwaysApply: true
+---
+
+# Plotting Standards
+
+When generating plots (Matplotlib, Seaborn, etc.), always ensure they are accessible to colorblind users by following these requirements.
+
+## 1. Multi-Channel Encoding
+Never rely on color alone to distinguish data series. Use at least two channels:
+- **Line Plots**: Use distinct `linestyles` (solid, dashed, dotted, dash-dot) AND distinct `markers` (circles, squares, triangles) alongside colors.
+- **Scatter Plots**: Use distinct marker shapes.
+- **Bar Charts**: Use distinct hatch patterns if color alone is ambiguous.
+
+## 2. Accessible Color Palettes
+Use high-contrast, colorblind-friendly palettes.
+- Prefer explicit hex codes for high contrast: `["#377eb8", "#4daf4a", "#e41a1c", "#984ea3", "#ff7f00"]`.
+- Or use built-in palettes like `tableau-colorblind10`.
+
+## 3. Legend Configuration
+- **Placement**: Default to `loc="upper left"` unless it obscures data.
+- **Ordering**: If a "control" or "baseline" condition exists (e.g., "permutation", "random", "shuffle"), place it LAST in the legend.
+- **Clarity**: Use LaTeX for labels in legends if they contain mathematical symbols.
+
+## 4. Implementation Example (Matplotlib)
+
+```python
+import matplotlib.pyplot as plt
+
+# ❌ BAD: Reliance on color only
+plt.plot(x, y1, color="red", label="Donor")
+plt.plot(x, y2, color="blue", label="Permutation")
+
+# ✅ GOOD: Multi-channel encoding
+linestyles = ["-", "--", "-.", ":"]
+markers = ["o", "s", "^", "D"]
+colors = ["#377eb8", "#4daf4a", "#e41a1c", "#984ea3"]
+
+for i, (label, data) in enumerate(all_data.items()):
+    plt.plot(
+        x, data,
+        ls=linestyles[i % 4],
+        marker=markers[i % 4],
+        color=colors[i % 4],
+        label=label,
+        markevery=0.1 # spacing markers
+    )
+plt.legend(loc="upper left")
+```

@@ -1,0 +1,44 @@
+---
+description: Always use LaTeX (not Unicode) for math in assistant replies and docs
+alwaysApply: true
+---
+
+# Math notation
+
+All mathematical expressions MUST be written in LaTeX, never as Unicode
+symbols, plain-text fractions, or mixed ASCII. This applies to:
+
+- Assistant chat messages (use `$...$` inline, `$$...$$` for display).
+- Markdown files I edit/create (same delimiters).
+- Docstrings / comments when they contain equations.
+
+## Examples
+
+Bad (do not produce):
+
+- `P(rank <= i)`
+- `O^(l,h)_i = Σ_j A_ij * V_j`
+- `R_KL ≈ 0.27`
+- `KL(P || Q)`
+- top-1 / top-10 (when used as formal notation)
+
+Good (always produce):
+
+- $P(\mathrm{rank} \leq i)$
+- $O^{(\ell, h)}_i = \sum_j A^{(\ell,h)}_{ij} V^{(\ell,h)}_j$
+- $R_{\mathrm{KL}} \approx 0.27$
+- $\mathrm{KL}(P \,\|\, Q)$
+- $\text{top-}1$ / $\text{top-}10$
+
+## Rules
+
+- Operators like $\leq, \geq, \approx, \neq, \in, \to$ — always LaTeX,
+  never `<=`, `>=`, `≈`, `≠`, `∈`, `→` in prose.
+- Subscripts/superscripts with multiple characters always in braces:
+  $R_{\mathrm{KL}}$, not $R_KL$.
+- Use `\mathrm` for multi-letter operators/labels (KL, JS, rank, argmax,
+  softmax) inside math mode.
+- Use `\,\|\,` for the double-bar in KL divergences.
+- Use `\ell` for layer index, not plain $l$.
+- Tables and inline ratios: still LaTeX-ify numeric references when they
+  name a metric, e.g. $R_{\mathrm{KL}} = 0.27$ rather than "R_KL = 0.27".

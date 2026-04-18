@@ -1,0 +1,491 @@
+
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} 
+\usepackage{multirow} 
+
+\usepackage{hyperref}
+
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+    basicstyle=\ttfamily\small, 
+    breaklines=true,            
+    frame=single,               
+    backgroundcolor=\color{gray!5},
+    captionpos=b,
+    keepspaces=true,
+    columns=flexible
+}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\usepackage[textsize=tiny]{todonotes}
+
+\icmltitlerunning{Your Transformer Can Process Two Texts at Once: Evidence of Linear Superposition in LLMs}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Your Transformer Can Process Two Texts at Once: Evidence of Linear Superposition in LLMs}
+
+  \icmlsetsymbol{equal}{*}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Firstname1 Lastname1}{equal,yyy}
+    \icmlauthor{Firstname2 Lastname2}{equal,yyy,comp}
+    \icmlauthor{Firstname3 Lastname3}{comp}
+    \icmlauthor{Firstname4 Lastname4}{sch}
+    \icmlauthor{Firstname5 Lastname5}{yyy}
+    \icmlauthor{Firstname6 Lastname6}{sch,yyy,comp}
+    \icmlauthor{Firstname7 Lastname7}{comp}
+
+    \icmlauthor{Firstname8 Lastname8}{sch}
+    \icmlauthor{Firstname8 Lastname8}{yyy,comp}
+
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{yyy}{Department of XXX, University of YYY, Location, Country}
+  \icmlaffiliation{comp}{Company Name, Location, Country}
+  \icmlaffiliation{sch}{School of ZZZ, Institute of WWW, Location, Country}
+
+  \icmlcorrespondingauthor{Firstname1 Lastname1}{first1.last1@xxx.edu}
+  \icmlcorrespondingauthor{Firstname2 Lastname2}{first2.last2@www.uk}
+
+  \icmlkeywords{Machine Learning, ICML}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}  
+
+\begin{abstract}
+
+While Large Language Models (LLMs) rely on highly non-linear components, in this work we demonstrate that they exhibit fundamental linearity: when inputs from distinct text streams are linearly combined, the model outputs a superposition of the individual next-token distributions. We term this the \textit{Superposition Linearity Hypothesis}. We provide evidence that superposition is an intrinsic property of the Transformer architecture rather than an emergent consequence of training; in fact, we observe that it tends to diminish as pretraining progresses. However, we demonstrate that linearity can be substantially restored through lightweight fine-tuning, significantly reducing the divergence between the predicted next-token distribution and the average of the individual next-token distributions. Finally, we introduce a guided decoding procedure that disentangles superposed outputs, enabling the simultaneous generation of two coherent continuations from a single forward pass.
+\end{abstract}
+
+\section{Introduction}
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/top-i_curves.pdf}
+    \caption{\textbf{Intrinsic superposition in next-token ranks.}
+    We mix two prefixes $A$ and $B$ by token-wise averaging embeddings, and obtain mixed logits \(\ell_{\text{mix}}\).
+    We then take the single-stream next-token prediction \(\hat{t}=\arg\max \ell_A\) (and symmetrically for \(B\)) and measure its rank under \(\ell_{\text{mix}}\).
+    The plot shows \(P(\mathrm{rank}_{\ell_{\text{mix}}}(\hat{t})\le i)\): the chance that a single-stream predicted token remains in the top-\(i\) of the mixed distribution.
+    This probability is already high for top-10 without finetuning and increases markedly after lightweight finetuning.
+    }
+    \label{fig:rank_curve}
+\end{figure}
+
+The Transformer architecture~\cite{vaswani2017attention} underlies modern Large Language Models (LLMs) and is built from highly non-linear components, including self-attention and MLP blocks with non-linear activations. The prevailing paradigm therefore treats inference as a single coherent semantic stream: to process multiple independent streams one typically runs separate forward passes, performs sequential processing, or modifies the architecture to avoid destructive interference between inputs.
+
+At the same time, recent work shows that, despite these non-linearities, decoder-only Transformers exhibit strong linear structure in the residual stream: transitions between consecutive layers can often be well-approximated by affine maps~\cite{TransformerIsSecretlyLinear}. This motivates a natural question: does such linearity extend beyond layer-to-layer geometry to the model's end-to-end input--output behavior? Specifically, are the computations sufficiently linear that the response to a linear combination of inputs approximates a corresponding combination of their independent outputs?
+
+We formalize this as the \textit{Superposition Linearity Hypothesis}: when two token streams with embeddings $\mathbf{x}_{A}$ and $\mathbf{x}_{B}$ are linearly combined (here, via element-wise averaging), the model processes the mixture as a superposition of the two pathways. Empirically, when embeddings from two distinct documents are averaged token-wise and passed through standard pre-trained LLMs, the next-token predictions associated with both streams consistently retain substantial mass in the mixed distribution; in particular, the ground-truth next tokens for both streams frequently appear within the top-10 ranks of the combined output distribution (Fig.~\ref{fig:rank_curve}).
+
+To distinguish architectural bias from learned capability, we track this phenomenon across the pre-training trajectory. We find that superposition fidelity is maximized at initialization and gradually diminishes as the model optimizes the language modeling objective, indicating that linear superposition is intrinsic to the architecture rather than a capability acquired through learning. We further observe a strong correlation between geometric linearity in hidden states (measured via feature additivity) and rank preservation under superposition.
+
+Although pre-training degrades this property, we show it can be substantially restored via a lightweight fine-tuning phase using less than $5\%$ of the original pre-training dataset size. Leveraging the amplified linearity, we then propose a decoding procedure that \textit{disentangles} the mixed hidden state, enabling recovery of the distinct continuations corresponding to the original input texts from a single mixed forward pass.
+
+Our contributions are summarized as follows:
+\begin{itemize}
+    \item We demonstrate that standard pre-trained LLMs retain high probability mass on the same tokens favored by the respective independent distributions.
+    \item We show that superposition linearity is an intrinsic architectural property and tends to degrade during pre-training, rather than a capability acquired through the learning process.
+    \item We show that the degraded linearity can be recovered using minimal fine-tuning ($<0.025\%$ of the full pre-training corpus).
+    \item We develop a decoding mechanism to disentangle the mixed output distribution back into its constituent text streams.
+\end{itemize}
+
+\section{Intrinsic Linearity in Large Language Models}
+\label{sec:intrinsic_linearity}
+
+In this section, we investigate the extent to which standard Transformers process superposed inputs without architectural modifications.
+
+\subsection{Problem Formulation}
+\label{subsec:formulation}
+
+We consider a decoder-only Transformer language model $M$, mapping a sequence of tokens from vocabulary $\mathcal{V}$ to a sequence of probability distributions over $\mathcal{V}$. Let $E: \mathcal{V} \to \mathbb{R}^d$ be the token embedding function. For a given input sequence $s = (s_1, \dots, s_T)$, the input representation at position $t$ is typically $h_t^{(0)} = E(s_t)$.
+
+We investigate the model's behavior when processing a superposition of two distinct input sequences, $x$ and $y$, of length $T$. We define the \textit{mixed input embedding} $z$ at position $t$ as the element-wise average of the constituent embeddings:
+\begin{equation}
+    e_t(z) = \frac{1}{2}\left(E(x_t) + E(y_t)\right).
+    \label{eq:superposition}
+\end{equation}
+This mixed representation $z$ is passed through the frozen pre-trained backbone $M$. The model processes this mixture using standard causal self-attention, where the attention mask allows attending to all prior mixed positions $z_{<t}$. We denote the output logits of the model given the mixed input as $\ell(z) \in \mathbb{R}^{|\mathcal{V}|}$ and the resulting probability distribution as $P_{mix}(z) = \text{softmax}(\ell(z))$.
+
+\begin{figure}[!b]
+    \centering
+
+    \includegraphics[width=0.9\linewidth]{figures/fig2.pdf}
+    \caption{\textbf{Robustness of Confident Predictions.} The median rank of the true token in the mixed distribution as a function of its probability in the original independent forward pass. Tokens predicted with high confidence ($P > 0.5$) almost always survive the superposition process (Median Rank $\approx  3$), whereas low-confidence predictions are more susceptible to interference.}
+    \label{fig:rank_vs_prob}
+\end{figure}
+
+We hypothesize that previously shown approximate linearity in layer-to-layer transitions this property extends to the global input-output mapping: specifically, that the model $M$ acts approximately linearly with respect to input superposition. Formally, we test whether $P_{mix}$ approximates the mixture of independent distributions $P_{avg} = 0.5(P(x) + P(y))$, and whether the ground-truth next tokens for both streams, $x_{next}$ and $y_{next}$, retain high probability mass in $P_{mix}$.
+
+To test this hypothesis, we first conducted an evaluation on unmodified pre-trained models. We evaluated models from the Pythia~\cite{biderman2023pythia}, Qwen~\cite{yang2025qwen3}, Llama~\cite{grattafiori2024llama}, and OLMo~\cite{groeneveld2024olmo}, Gemma~\cite{team2024gemma},
+
+families. For data, we used TinyStories~\cite{eldan2023tinystories} (simplified grammar) and FineWeb~\cite{penedo2024fineweb} (real-world naturalistic web text). From each dataset, we sampled random text pairs $(x^{(A)}, x^{(B)})$, tokenized them, and truncated to fixed context lengths of $L=32$ and $L=128$ tokens.
+
+\subsection{Rank Analysis}
+\label{subsec:rank_analysis}
+
+To quantify the preservation of information under superposition, we analyze the rank of the ground-truth next token within the output distribution of the mixed state. Let $t_A$ be the token predicted by the model for input sequence $A$ (i.e., $\arg\max P(x|A)$). We compute the rank of $t_A$ within the mixed distribution $P_{mix} = \text{softmax}(M( \frac{1}{2}(E_A + E_B) ))$. Ideally, if the superposition were perfectly linear, the output distribution would approximate $0.5(P_A + P_B)$, placing $t_A$ and $t_B$ at the very top of the ranking (ranks 1 and 2). In a standard non-linear neural network, one might expect the sum of embeddings to result in a representation orthogonal to both original semantics, pushing $t_A$ and $t_B$ into the tail of the distribution (rank $\sim |\mathcal{V}|/2$).
+
+\paragraph{Cumulative Rank Distribution}
+We computed the cumulative distribution function (CDF) of the ranks, $P(\text{rank} \le k)$, for unmodified pre-trained models. Fig.~\ref{fig:rank_curve} illustrates these curves for the Pythia-2.8B, Llama-3.2-3B, and Qwen2.5-3B models.
+
+Our results reveal that the Transformer architecture possesses a surprising degree of intrinsic linearity. Despite the destructive interference inherent in averaging high-dimensional feature vectors, the ground-truth tokens survive the mixing process with high frequency. Specifically, across these architectures (represented by solid lines in the figure):
+\begin{itemize}
+    \item In approximately \textbf{30--40\%} of cases, the true token appears within the top-10 ranks.
+    \item In \textbf{50--60\%} of cases, the true token is found within the top-50 ranks.
+    \item By the top-100 ranks, the recovery rate reaches upwards of \textbf{60--65\%}.
+\end{itemize}
+Considering the large vocabulary sizes ($|\mathcal{V}| \ge 50,000$), these results indicate that the ``signal'' from the original inputs is preserved well above the noise floor. The mixed state does not collapse into gibberish; rather, it effectively narrows down the search space to a small neighborhood containing the valid continuations for both constituent contexts.
+
+\paragraph{Dependency on Model Confidence}
+To understand the mechanism behind rank preservation, we analyzed the relationship between the model's confidence in the original prediction and the token's survival in the mix. We hypothesize that ``sharper'' predictions—corresponding to hidden states with larger projection magnitudes onto the unembedding matrix—are more robust to the interference caused by the second sequence.
+
+Figure~\ref{fig:rank_vs_prob} plots the median rank of the true token in the mixed distribution against its probability in the single-stream forward pass. We observe a strong negative correlation. When the model is highly confident in its prediction ($P(t_A|A) > 0.5$), the median rank in the mixed distribution is consistently $\le 3$, though with modest degradation for very high-confidence tokens ($P(t) \geq 0.95$) in the Pythia family. Conversely, when the original prediction is uncertain ($P(t_A|A) < 0.2$), the rank in the mixture degrades significantly.
+
+This suggests that the ``Superposition Linearity'' is not a uniform property across all inputs but acts as a \textit{constructive interference} mechanism that favors dominant semantic signals. When the signal for $t_A$ is strong, it dominates the noise introduced by the vector component of context $B$, allowing $t_A$ to remain at the top of the decoded distribution.
+
+\begin{table}[h]
+    \tiny
+    \centering
+    \caption{\textbf{Distributional Approximation Metrics.} Comparison of distances between the model output on mixed inputs vs. the target mixture distribution. The \textit{Ratio} indicates the improvement over a random baseline. Lower is better.}
+    \label{tab:dist_metrics}
+    \begin{tabular}{l|cc|cc|cc}
+        \toprule
+        \multirow{2}{*}{\textbf{Model}} & \multicolumn{2}{c|}{\textbf{KL Divergence}} & \multicolumn{2}{c|}{\textbf{JS Divergence}} & \multicolumn{2}{c}{\textbf{Wasserstein}} \\
+         & Value & Ratio & Value & Ratio & Value & Ratio \\
+        \midrule
+        Pythia-160M & 0.91 & \textbf{0.35} & 0.23 & \textbf{0.40} & 0.27 & \textbf{0.63} \\
+        Pythia-410M & 1.54 & 0.39 & 0.36 & 0.50 & 0.30 & 0.69 \\
+        Pythia-2.8B & 1.86 & 0.42 & 0.40 & 0.54 & 0.31 & 0.71 \\
+        Llama-3.1-8B  & 2.16 & 0.37 & 0.48 & 0.57 & 0.32 & 0.69 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Distributional Shape Preservation}
+\label{subsec:distribution_analysis}
+
+Rank-based metrics confirm that the correct tokens often remain salient under embedding mixing, but they do not capture whether the \emph{full} next-token distribution behaves like a linear mixture. Under the Superposition Linearity Hypothesis, we expect the mixed-input output $P_{\text{mix}}$ to approximate the arithmetic mean of the two independent distributions:
+\begin{equation}
+P_{\text{target}}(x|A, B) = \frac{1}{2} \left( P(x|A) + P(x|B) \right)
+\end{equation}
+
+We quantify the mismatch $\mathcal{D}\!\left(P_{\text{target}}, P_{\text{mix}}\right)$ using KL and Jensen--Shannon (JS) divergences, and a Wasserstein distance computed on the top-$256$ tokens with cosine distance between token embeddings as the ground metric.\footnote{For numerical stability in KL and JS, we applied temperature smoothing ($\tau=1.5$). The Wasserstein distance was computed on raw probabilities for the top-256 tokens, using the \textbf{cosine distance} between token embeddings as the ground metric to capture semantic proximity.}
+
+To make distances comparable across model families and contexts, we report a normalized \emph{Superposition Approximation Ratio}:
+\begin{equation}
+\mathcal{R}_{\mathcal{D}}
+\;=\;
+\frac{\mathbb{E}_{(A,B)}\!\left[\mathcal{D}\!\left(P_{\text{target}} \,\|\, P_{\text{mix}}\right)\right]}
+{\mathbb{E}_{(A,B)}\!\left[\mathcal{D}\!\left(P(\cdot\mid A) \,\|\, P(\cdot\mid B)\right)\right]}.
+\end{equation}
+Values $\mathcal{R}_{\mathcal{D}}<1$ indicate that the mixed-state output is closer to the ideal linear mixture than two unrelated contexts are to each other.
+
+Across standard pre-trained models on FineWeb, Table~\ref{tab:dist_metrics} shows $\mathcal{R}_{\mathcal{D}}<1$ consistently for KL, JS, and Wasserstein distances, indicating that $P_{\text{mix}}$ preserves substantial distributional structure of the target mixture rather than collapsing to an unrelated distribution.
+
+\begin{figure}[!b]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/fig3.pdf}
+    \caption{\textbf{Contextual Stability of Superposition.} The mean Total Variation Distance (TVD) between the mixed output distribution and the target mixture across token positions. While the divergence is slightly lower for the initial tokens ($t < 20$), it quickly stabilizes and remains constant throughout the rest of the context window, indicating that the superposition property does not degrade with longer sequences.}
+    \label{fig:tvd_position}
+\end{figure}
+
+\subsection{Contextual Stability}
+We further investigated whether this linearity is an artifact of specific positions (e.g., initial tokens) or a stable property throughout the context window. We tracked the Total Variation Distance (TVD) between $P(z)$ and $P_{target}$ as a function of the token position index $t$, as illustrated in Fig.~\ref{fig:tvd_position}.
+
+Our analysis reveals that superposition fidelity is stable across the context window. The TVD is slightly lower for the first few tokens ($t < 20$) and then stabilizes at a constant level for the remaining positions. This indicates that the geometric properties required for linear superposition are robust to the evolving internal state of the Transformer and persist as the context becomes increasingly complex.
+
+\subsection{Linearity Dynamics During Training}
+\label{subsec:training_dynamics}
+
+To understand whether superposition is an emergent capability or an architectural bias that training erodes, we tracked \emph{hidden-state additivity} across the pre-training trajectory of the Pythia family. We evaluate intermediate checkpoints from step 32 to step 143{,}000 on a fixed subset of FineWeb, sampling random prefix pairs $(A,B)$ and running three forward passes: stream $A$ (input embeddings $E(A)$), stream $B$ (input embeddings $E(B)$), and the mixed input $E_{\text{mix}}$ defined by the token-wise mean of embeddings as in Eq.~\eqref{eq:superposition}.
+
+Let $h^{(A)}_{l,t}$, $h^{(B)}_{l,t}$, and $h^{(\text{mix})}_{l,t}$ denote the hidden states at index $l$ for token position $t$ under these three forward passes. We first mean-center the hidden states using per-layer means estimated over the evaluation set:
+\begin{equation}
+\begin{aligned}
+\tilde h^{(A)}_{l,t} &= h^{(A)}_{l,t} - \mu^{(A)}_{l}, \\
+\tilde h^{(B)}_{l,t} &= h^{(B)}_{l,t} - \mu^{(A)}_{l}, \\
+\tilde h^{(\text{mix})}_{l,t} &= h^{(\text{mix})}_{l,t} - \mu^{(\text{mix})}_{l}.
+\end{aligned}
+\label{eq:centering}
+\end{equation}
+
+We then quantify \emph{superposition linearity in hidden states} by comparing the mixed-stream activations to the average of the two single-stream activations, after mean-centering and per-token $\ell_2$ normalization. Specifically, at each hidden-state index $l$ and token position $t$, we compute
+\begin{equation}
+\epsilon_{l,t}(A,B) \;=\;
+\left\|
+\frac{\tilde h^{(\text{mix})}_{l,t}}{\|\tilde h^{(\text{mix})}_{l,t}\|_2}
+-
+\frac{\tilde h^{(A)}_{l,t} + \tilde h^{(B)}_{l,t}}{\|\tilde h^{(A)}_{l,t} + \tilde h^{(B)}_{l,t}\|_2}
+\right\|_2.
+\label{eq:train_dyn_err}
+\end{equation}
+We report $\mathcal{E}_l=\mathbb{E}_{(A,B),t}\!\left[\epsilon_{l,t}(A,B)\right]$ and its layer-averaged summary $\bar{\mathcal{E}}$ (lower indicates stronger superposition linearity).
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/linearity_training_dynamics_pythias.pdf}
+    \caption{\textbf{Superposition linearity degrades during pre-training.} Mean hidden-state superposition error $\bar{\mathcal{E}}$ (lower is better) across intermediate checkpoints for Pythia models of different sizes. The metric is the $\ell_2$ distance between (i) the mean-centered mixed hidden state $\tilde h^{(\text{mix})}_{l,t}$ and (ii) the mean-centered summed hidden state $\tilde h^{(A)}_{l,t}+\tilde h^{(B)}_{l,t}$, after $\ell_2$ normalization of both vectors, averaged over token positions, sampled pairs, and hidden-state indices. Shaded regions indicate $\pm$ standard error across hidden-state indices at each checkpoint.}
+    \label{fig:training_dynamics}
+\end{figure}
+
+As shown in Fig.~\ref{fig:training_dynamics}, hidden-state superposition linearity is strongest at the earliest checkpoints and progressively degrades as training proceeds, consistent with pre-training increasing non-linear interactions in the residual stream.
+
+\subsection{Layer-wise Linearization Dynamics}
+\label{subsec:layerwise_analysis}
+
+To investigate the internal mechanism supporting this superposition, we analyze the geometric linearity of transformations layer by layer. Specifically, we measure the extent to which the mapping from the hidden states of layer $l$, denoted $\mathbf{H}^{(l)}$, to the hidden states of layer $l+1$, $\mathbf{H}^{(l+1)}$, can be approximated by a linear transformation.
+
+We use the \textit{linearity score} introduced in~\cite{TransformerIsSecretlyLinear}. Given a batch of activations, we form matrices $\mathbf{X}, \mathbf{Y} \in \mathbb{R}^{n \times d}$ by stacking $n$ token feature vectors from layers $l$ and $l{+}1$, respectively, and mean-center each matrix by subtracting the average feature vector over the $n$ samples (rows).
+
+To remove scale effects, we normalize by Frobenius norms, $\tilde{\mathbf{X}} = \mathbf{X}/\|\mathbf{X}\|_F$ and $\tilde{\mathbf{Y}} = \mathbf{Y}/\|\mathbf{Y}\|_F$. The linearity score is then defined as
+\[
+\text{lin}(\mathbf{X},\mathbf{Y}) \;=\;
+1 - \min_{\mathbf{A}\in\mathbb{R}^{d\times d}}
+\left\| \tilde{\mathbf{X}}\mathbf{A} - \tilde{\mathbf{Y}} \right\|_F^2,
+\]
+where the minimizer $\mathbf{A}^\star$ is the least-squares solution. A score close to $1$ indicates that $\mathbf{H}^{(l+1)}$ lies close to an affine-linear reparameterization of $\mathbf{H}^{(l)}$, whereas scores close to $0$ reflect stronger deviations from a global linear map between the two layers.
+
+\begin{figure}[!b]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/secretly_linearities_profiles.pdf}
+    \caption{\textbf{Layer-wise Linearization Dynamics.} The linearity score ($1-\text{err}^2$) \cite{TransformerIsSecretlyLinear} between consecutive layers for the base models and the fine-tuned models. The fine-tuned models exhibits consistently higher linearity scores, particularly in the deep layers, indicating that the optimization objective effectively linearizes the internal state transitions.}
+    \label{fig:layerwise}
+\end{figure}
+
+Figure~\ref{fig:layerwise} illustrates the evolution of this metric across the network depth, revealing a U-shaped trajectory. In the initial phase (layers 0--5), linearity remains relatively high, likely reflecting the initial embedding integration. As the signal propagates into the middle layers (6--20), the linearity score drops significantly, reaching a minimum near $0.65$. This region corresponds to the computational core of the Transformer, where MLP and attention blocks perform the non-linear operations necessary for resolving complex dependencies. However, in the final third of the network (layers 20--32), linearity recovers substantially, peaking above $0.95$. This ``terminal linearity'' suggests that the deep layers function primarily to align high-level features with the unembedding matrix. This observation offers a geometric explanation for the rank preservation results in Section~\ref{subsec:rank_analysis}: the quasi-linear final stage prevents the collapse of the superposed signal $z \approx x + y$ before it reaches the output logits.
+
+To investigate whether the superposition capability is an emergent property of learning or an intrinsic feature of the architecture, we analyzed the training dynamics of the Pythia-2.8B model. We utilized intermediate checkpoints ranging from step 32 to step 143,000 (convergence), evaluating the superposition metrics defined in Sec.~\ref{sec:intrinsic_linearity} on a fixed subset of the FineWeb dataset.
+
+\section{Improving Linearity with Finetuning}
+\label{sec:improving_linearity}
+
+As demonstrated in Sec.~\ref{sec:intrinsic_linearity}, pre-trained Transformer models exhibit an intrinsic, albeit approximate, ability to process superposed inputs linearly. This property is present despite the standard pre-training objective not explicitly incentivizing such behavior. Here, we investigate whether this architectural capability can be enhanced through targeted optimization. We explore if a lightweight fine-tuning phase can align the model's weights to explicitly support superposition.
+
+We employ a self-distillation framework designed to minimize the discrepancy between the model's output on a mixed input and the mixture of its independent outputs. We initialize a student model $M_{student}$ with pre-trained weights and use a frozen copy of the same model as the teacher $M_{teacher}$. For a pair of distinct text sequences $x^{(A)}$ and $x^{(B)}$, we define the target probability distribution as the arithmetic mean of the teacher's independent predictions:
+\begin{equation}
+    P_{target} = \frac{1}{2} \left( M_{teacher}(x^{(A)}) + M_{teacher}(x^{(B)}) \right).
+\end{equation}
+The student model processes the element-wise average of the input embeddings $z = \frac{1}{2}(E(x^{(A)}) + E(x^{(B)}))$. The objective is to minimize the Kullback-Leibler (KL) divergence between the student's output and the target mixture:
+\begin{equation}
+    \mathcal{L} = D_{KL}\left( P_{target} \parallel M_{student}(z) \right).
+\end{equation}
+We applied this procedure to the Pythia, Qwen and Llama models using a subset of the FineWeb dataset (approximately 200k steps).
+
+Revisiting the quantitative metrics defined in Sec.~\ref{sec:intrinsic_linearity}, we observe that fine-tuning significantly reduces the divergence between the predicted and target distributions. In Experiment 2, the median KL divergence decreased from $1.86$ in the base model to $0.37$ in the fine-tuned model. In terms of the \textit{Superposition Approximation Ratio} $\mathcal{R}$ (see~Sec.~\ref{subsec:distribution_analysis}), the $\mathcal{R}_{KL}$ dropped from $0.42\times$ to $0.09\times$. These results indicate that after fine-tuning, the model's output on a mixed input approximates the analytical mean of the distributions with an error margin significantly smaller than the statistical distance between independent contexts. This suggests that the interference observed in the vanilla model is largely reversible.
+
+To understand the internal mechanism of this improvement, we re-evaluated the layer-wise linearity scores introduced in Sec.~\ref{subsec:layerwise_analysis}. As shown in Fig.~\ref{fig:layerwise}, both models exhibit a U-shaped linearity profile. However, the fine-tuned model (Orange curve) maintains consistently higher linearity scores across the network depth. We observe a notable contrast between the relatively modest magnitude of these local improvements and the substantial reduction in the global output divergence (e.g. see Fig.~\ref{fig:rank_curve}). We hypothesize that this discrepancy is explained by the accumulation of non-linear errors: in deep networks, small deviations from linearity at each layer compound across the depth of the model. Consequently, even the moderate increase in linearity observed at individual layers appears sufficient to prevent the cascading interference that degrades the signal in the base model.
+
+Finally, we assess the recoverability of the input signals by analyzing the rank of the ground-truth next tokens in the output distribution, using the same methods as in Sec.~\ref{subsec:rank_analysis}. Fig.~\ref{fig:rank_curve} compares the cumulative rank distribution for the fine-tuned model against the baseline. For the base model, the correct tokens frequently appear in the tail of the distribution due to interference. In contrast, the fine-tuned model shows a marked improvement: the probability of the true next token appearing in the top-5 ranks increases from approximately $30\%$ to over $60\%$. This indicates that the information corresponding to both input contexts is preserved with high fidelity at the final layer, potentially enabling the explicit separation of the constituent streams.
+
+\section{Mixture Separation}
+\label{sec:mixture_separation}
+
+While the previous section established that Transformer models can be fine-tuned to improve linearity in their outputs, the resulting output distribution $P(z)$ remains a superposition of two distinct semantic streams. Ideally, $P(z)$ should approximate $0.5(P(x|A) + P(x|B))$. Sampling directly from this mixture creates semantically inconsistent sequence, as the model alternates between the tokens of context $A$ and context $B$. To make superposition practically useful for parallel processing, we require a mechanism capable of disentangling the mixed hidden state back into its constituent streams. In this section, we propose methods for disentanglement and establish robust metrics to evaluate the separation quality.
+
+\subsection{Gradient-Optimized Logit Arithmetic}
+
+To recover the distinct continuations from the superposed state without architectural modification, we introduce an inference-time separation method that leverages a smaller auxiliary model ($M_{small}$) to guide the decoding of the large backbone ($M_{large}$). We posit that the logits of the target stream $A$ can be recovered via a linear combination of the mixed logits from the large model and the independent logits from the small model. Formally, for two streams $A$ and $B$, we define the disentangled logits $\tilde{\ell}^{(A)}$ and $\tilde{\ell}^{(B)}$ as:
+
+\begin{align}
+\tilde{\ell}^{(A)} &= \ell_{large}(z) + \alpha \cdot \ell_{small}(A) -  \beta \cdot \ell_{small}(B) \\
+\tilde{\ell}^{(B)} &= \ell_{large}(z) + \alpha  \cdot \ell_{small}(B) -\beta \cdot \ell_{small}(A)
+\end{align}
+
+Here, $z$ represents the mixed input $\frac{1}{2}(E(A) + E(B))$. The term $\alpha \cdot \ell_{small}(A)$ amplifies the signal specific to context $A$, while $-\beta \cdot \ell_{small}(B)$ explicitly suppresses the interfering signal from context $B$. This formulation uses the small model as a semantic filter, extracting the high-quality reasoning of the large model (contained in $\ell_{large}(z)$) while discarding the unwanted component.
+
+To determine the optimal scalar coefficients $\alpha, \beta$, we employ a gradient-based optimization procedure. Keeping the weights of both $M_{large}$ and $M_{small}$ frozen, we optimize these scalars to minimize the cross-entropy loss between the reconstructed logits and the ground-truth next tokens on a small calibration dataset. This approach allows us to dynamically balance the trade-off between the large model's expressivity and the small model's directional guidance.
+
+\subsection{Joint Contrastive Logit Guidance}
+
+\begin{table*}[t!]
+    \small
+    \centering
+    \caption{\textbf{Quantitative Recovery and Separation Metrics.} Comparison of prediction accuracy (on LAMBADA) and semantic leakage (on FineWeb). \textbf{LAMBADA Acc.} reports the mean accuracy across both streams compared to independent baselines. \textbf{Jaccard (FineWeb)} measures the token overlap between generated continuations (lower indicates better separation).}
+    \label{tab:quant_metrics}
+    \begin{tabular}{llcccc}
+        \toprule
+        \textbf{Backbone ($M_{large}$)} & \textbf{Guide ($M_{small}$)} & \textbf{Method} & \textbf{LAMBADA Baseline} & \textbf{LAMBADA Superposed} & \textbf{Jaccard} \\
+        & & & ($M_{large}$ / $M_{small}$) & (Mean Acc.) & (FineWeb) \\
+        \midrule
+        \textbf{Qwen2.5-3B} & Qwen2.5-0.5B & Pretrained & 0.592 / 0.437 & 0.168 & 0.126 \\
+        \textbf{Qwen2.5-3B} & Qwen2.5-0.5B & Mixed Distillation & 0.592 / 0.437 & 0.207 & 0.133 \\
+        \textbf{Qwen2.5-3B} & Qwen2.5-0.5B & \textbf{Joint Contrastive} & 0.592 / 0.437 & \textbf{0.345} & \textbf{0.061} \\
+        \midrule
+        \textbf{Llama-3.2-3B} & Llama-3.2-1B & Pretrained & 0.643 / 0.540 & 0.182 & 0.094 \\
+        \textbf{Llama-3.2-3B} & Llama-3.2-1B & Two Heads & 0.643 / 0.540 & 0.105 & 0.235 \\
+        \textbf{Llama-3.2-3B} & Llama-3.2-1B & Mixed Distillation & 0.643 / 0.540 & 0.174 & 0.090 \\
+        \textbf{Llama-3.2-3B} & Llama-3.2-1B & \textbf{Joint Contrastive} & 0.643 / 0.540 & \textbf{0.430} & \textbf{0.067} \\
+        \midrule
+        \textbf{Pythia-6.9B} & Pythia-160m & Two Heads & 0.560 / 0.225 & 0.080 & 0.080 \\
+        \textbf{Pythia-2.8B} & Pythia-160m & Pretrained & 0.544 / 0.225 & 0.065 & 0.109 \\
+        \textbf{Pythia-2.8B} & Pythia-160m & Mixed Distillation & 0.544 / 0.225 & 0.088 & 0.112 \\
+        \textbf{Pythia-2.8B} & Pythia-160m & Two Heads & 0.544 / 0.225 & 0.164 & 0.117 \\
+        \textbf{Pythia-1.4B} & Pythia-160m & \textbf{Joint Contrastive} & 0.499 / 0.225 & \textbf{0.110} & \textbf{0.080} \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\begin{table}[b!]
+    \small
+    \centering
+    \caption{\textbf{Linguistic Quality on TinyStories (Pythia-2.8B).} Comparison of independent execution scores with superposed states (1--10 scale, averaged across streams).}
+    \label{tab:tinystories_qual}
+    \begin{tabular}{lccc}
+        \toprule
+        \textbf{Metric} & \textbf{Independent} & \textbf{Superposed} & \textbf{Superposed} \\
+                        & \textbf{Baseline}    & \textbf{(Pretrained)} & \textbf{(Fine-tuned)} \\
+        \midrule
+        Grammar         & 4.52 & 2.59 & \textbf{3.69} \\
+        Consistency     & 3.57 & 2.70 & \textbf{3.53} \\
+        Creativity      & 5.72 & 2.08 & 2.13 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+While the previous approach optimizes scalar coefficients at inference time, we can also adapt the large model's internal representations to exploit this guidance more effectively. We propose a joint training framework where the large model is fine-tuned in tandem with the guidance signals.
+
+In this formulation, we incorporate the guidance logic directly into the training loop. The effective logits are computed symmetrically as in the inference-time method, but $\alpha$ and $\beta$ are initialized to $1.0$ and optimized jointly with the model parameters. We minimize the joint cross-entropy loss over randomly paired text sequences $(A, B)$:
+\begin{equation}
+\mathcal{L} = \mathbb{E}_{(A,B)} \left[ \mathcal{L}_{\text{CE}}\bigl(\tilde{\ell}^{(A)}_t, A_{t+1}\bigr) + \mathcal{L}_{\text{CE}}\bigl(\tilde{\ell}^{(B)}_t, B_{t+1}\bigr) \right]
+\end{equation}
+This objective ensures that the large model learns to generate superposed representations that are optimally disentangled by the learned contrastive profile.
+
+\subsection{Two-Head Separation via Symmetry Breaking}
+
+To eliminate the dependency on auxiliary models, we introduce an architectural modification based on explicit symmetry breaking. A key challenge in standard superposition is permutation invariance: the averaging operation is commutative, leaving the model with no structural information to distinguish head $A$ from head $B$.
+
+We resolve this by introducing learnable projections $W_A, W_B \in \mathbb{R}^{d \times d}$ after the embedding layer and two separate output heads. The mixed representation becomes $z = \text{Norm}(W_A E(A) + W_B E(B))$. To break symmetry from the start, we initialize the projections with distinct Gaussian noise:
+\begin{equation}
+    W_k = I + \mathcal{N}(0, \sigma^2), \quad k \in \{A, B\}
+\end{equation}
+with $\sigma=10^{-3}$. This allows the backbone to process an asymmetric mixture while maintaining stability. We train end-to-end with a joint loss over both heads, allowing the model to internalize the separation logic entirely.
+
+During our experiments, we observed that naive optimization of the joint loss often leads to a degenerate solution where the backbone attends exclusively to one input stream, ignoring the other. To prevent this convergence to a single mode, we introduce dynamic loss balancing.
+
+The total objective is defined as $\mathcal{L} = \alpha_t \mathcal{L}_A + \beta_t \mathcal{L}_B$. We adjust the coefficients $\alpha_t, \beta_t$ dynamically based on the exponential moving average (EMA) of the historical losses. Specifically, at step $t$:
+\begin{equation}
+    \alpha_t \propto \left( \frac{\bar{\mathcal{L}}_{A,t}}{\bar{\mathcal{L}}_{A,t} + \bar{\mathcal{L}}_{B,t}} \right)^\gamma
+\end{equation}
+where $\bar{\mathcal{L}}$ denotes the EMA and $\gamma$ is a strength hyperparameter. This feedback mechanism assigns higher weight to the stream with higher loss, forcing the backbone to recover the suppressed signal if one head begins to lag.
+
+\subsection{Metrics of Disentanglement \& Results}
+\label{subsec:metrics_of_disentanglement_results}
+
+Evaluating the success of mixture separation requires measuring not only the quality of the generated text but also the degree of semantic isolation between the two output streams. We employ a combination of semantic similarity metrics, LLM-based evaluation, and standard benchmarks.
+
+\paragraph{Semantic Distinctness (Jaccard Similarity)}
+A key failure mode in superposition is ``leakage'', where tokens from stream $B$ appear in stream $A$'s output. We quantify this via Jaccard similarity between unique token sets $S_A$ and $S_B$:
+\begin{equation}
+    J(S_A, S_B) = \frac{|S_A \cap S_B|}{|S_A \cup S_B|}
+\end{equation}
+Lower values indicate better separation. We compute this on FineWeb samples using 32-token prefixes and 64-token generations.
+
+As shown in Table~\ref{tab:quant_metrics}, guided decoding separates streams even in pretrained models, with Jaccard indices of $0.094$ (Llama-3.2) and $0.109$ (Pythia-2.8B). With separate distillation, Pythia-2.8B maintains a low index (0.117), confirming distinct semantic vocabularies without collapsing into shared output. Llama-3.2 shows higher overlap (0.236), indicating more leakage without fine-tuning.
+
+\paragraph{LLM-as-a-Judge Evaluation}
+To assess linguistic quality of disentangled outputs, we follow the TinyStories protocol~\cite{eldan2023tinystories}, using an instruction-tuned model (OpenAI/GPT-5.2) to grade completions on \textit{Grammar}, \textit{Creativity}, \textit{Consistency}, and \textit{Plot Coherence} (1--10 scale), plus estimated writer ``age group''.
+
+We compared Pythia-2.8B in three states: independent, raw superposition, and distilled with guided decoding (Table~\ref{tab:tinystories_qual}). While raw superposition struggles syntactically (Grammar: 2.59), our approach recovers significant capability, raising Grammar to 3.69 and Consistency to 3.53—restoring structural integrity.
+
+\paragraph{LAMBADA}
+We evaluate on LAMBADA~\cite{paperno2016lambada} to assess long-range dependency modeling. These passages require broad context: annotators cannot guess the final word from the target sentence alone, but predict it easily given prior context.
+
+We observe three distinct tiers of performance (Table~\ref{tab:quant_metrics}). Raw superposition yields a low accuracy ($\approx 6-16\%$), confirming that while signal exists, it is heavily obscured. Applying specialized distillation increases this to $\approx 17-18\%$. However, the \textit{Joint Contrastive Logit Guidance} method (Sec.~\ref{sec:mixture_separation}) demonstrates superior signal recovery, achieving an accuracy of 43.0\% for the Llama-3.2 pair. While this still lags behind the independent small model baseline (54.0\%), it represents a substantial improvement over post-hoc methods, suggesting that end-to-end optimization allows the backbone to construct more separable representations.
+
+\section{Conclusion}
+
+In this work, we demonstrated that Transformers can process linearly combined text streams as a superposition of independent pathways. We showed that while this intrinsic architectural property degrades during standard pre-training, it can be robustly restored via lightweight fine-tuning, allowing the model to maintain distinct semantic signals within a mixed hidden state.
+
+These findings have profound implications for efficient deployment. By successfully disentangling superposed outputs, our approach enables the generation of two coherent continuations from a single forward pass, theoretically offering a $\mathbf{2\times}$ increase in inference throughput. Furthermore, since multiple streams are compressed into a single vector representation, this paradigm drastically reduces memory consumption, effectively halving the KV-cache footprint per active stream.
+
+\section{Related Work}
+
+Decoder-only Transformers exhibit surprisingly linear behavior in the residual stream: consecutive-layer mappings are often well-approximated by affine transforms \citep{TransformerIsSecretlyLinear}. Closely related are methods that \emph{explicitly} multiplex multiple inputs into a single representation and then demultiplex predictions, e.g., DataMUX \citep{murahari2022datamux}, binding/unbinding-based MIMONets \citep{menet2023mimonets}, and RevMUX for efficient LLM batch inference via reversible adapters \citep{xu2024revmux}. At inference time, superposition is also exploited for parallel generation or context processing: Superposed Decoding mixes draft token embeddings to produce multiple continuations in one autoregressive pass \citep{shen2024superposed}, while superposition prompting accelerates RAG by processing multiple document paths within a single forward pass \citep{merth2024superpositionprompting}. Complementary perspectives include task superposition in in-context learning \citep{xiong2024everything} and feature superposition as a representational bottleneck \citep{elhage2022toy}. In contrast to approaches that add mux/demux structure, we isolate an \emph{intrinsic} input--output superposition effect in standard pretrained LLMs under linear embedding mixing, track its degradation during pretraining, and show it can be restored by lightweight finetuning and partially disentangled at decoding time.
+
+\section{Limitations}
+\label{sec:limitations}
+
+Our current analysis focuses on binary text streams ($N=2$) to isolate the fundamental mechanics of linearity without the confounding factors of higher-order interference. While scaling to $N > 2$ offers further throughput gains, it presents signal-to-noise challenges that require exploring the theoretical capacity of the embedding space.
+
+Additionally, our evaluations utilized short-context ($L \le 128$) monolingual corpora. Generalizing this approach to multilingual settings or extended contexts involves more complex embedding geometries, presenting an important avenue for future work to validate the universality of phenomena across broader distributions.
+
+\section*{Impact Statement}
+
+Our findings can directly improve the scalability and accessibility of large language models by increasing throughput and lowering infrastructure costs. This may benefit applications requiring high-volume or real-time language generation, such as chatbots and large-scale retrieval-augmented systems.
+
+We recognize that parallel processing techniques could also introduce new risks if misapplied, for example by inadvertently mixing unrelated or sensitive streams. Careful validation and monitoring will be important in downstream systems. Overall, this work contributes to the responsible advancement of efficient language modeling and opens new directions for model design that exploit intrinsic architectural properties.
+
+\nocite{langley00}
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+\newpage
+\appendix
+\onecolumn
+\section{LLM as a Judge Prompt}
+\label{appendix:llm-as-a-judge-prompt}
+
+\begin{lstlisting}[language={} , caption={The prompt used for evaluating student completions.}]
+The following exercise, the student is given a beginning of a story. The student needs to complete it into a full story. The exercise tests the student's language abilities and creativity. The symbol *** marks the separator between the prescribed beginning and the student's completion:
+
+{} *** {}
+
+Please provide your general assessment about the part written by the student (the one after the *** symbol). Is it grammatically correct? Is it consistent with the beginning of the story? Pay special attention to whether the student manages to complete the sentence which is split in the middle by the separator ***.
+
+Then, grade the student's completion in terms of:
+1. Grammar: /10
+2. Creativity: /10  
+3. Consistency: /10
+4. Plot coherence: /10
+
+Finally, provide your best guess of what the age of the student might be, as reflected from the completion. Choose from possible age groups: A: 3 or under. B: 4-5. C: 6-7. D: 8-9. E: 10-12. F: 13-16.
+
+Please output your response in the following format:
+General assessment: [text]
+Grammar: X/10
+Creativity: Y/10
+Consistency: Z/10
+Plot: W/10
+Age group: [Letter A/B/C/D/E/F]
+
+For example: 
+The student’s completion of the story is mostly consistent with the beginning of the story. It maintains the focus on Lily and her family, and the sentence split by the separator is completed correctly. However, the student’s addition does not fully integrate the shiny decorations found in the attic, which were a significant part of the beginning.
+The grammar is generally correct, but there are a few minor errors: ⟨list omitted⟩.
+Overall, the student’s completion of the story demonstrates adequate language abilities and creativity, but could benefit from better integration of the shiny decorations and minor grammar improvements.
+Grammar: 8/10, Creativity: 7/10, Consistency: 7/10, Age group: E (10-12)
+\end{lstlisting}
+
+\end{document}

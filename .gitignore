@@ -1,5 +1,5 @@
-__pycache__/
-checkpoints/
+__pycache__
+checkpoints
 wandb/
 tensorboard_logs/
 logs/
@@ -7,3 +7,4 @@ logs/
 RESULT_FOLDER
 analyze_lambada.ipynb
 lambada_test_filtered.jsonl
+results_split_merge/

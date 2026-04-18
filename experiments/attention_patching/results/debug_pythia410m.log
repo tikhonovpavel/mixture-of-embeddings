@@ -1,0 +1,111 @@
+[run] model=EleutherAI/pythia-410m
+[run] num_pairs=50  T=128
+[run] saving to experiments/attention_patching/results/patch_EleutherAI_pythia-410m_N50_T128_20260417_135437.{parquet,json}
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/292 [00:00<?, ?it/s]Loading weights:  56%|█████▌    | 164/292 [00:00<00:00, 1624.35it/s]Loading weights: 100%|██████████| 292/292 [00:00<00:00, 1642.27it/s]
+[data] streaming HuggingFaceFW/fineweb-edu/sample-10BT ...
+[data] got 225 raw texts; tokenizing to T=128
+[run] pair 2/50 (4.0%)  elapsed=20.4s  eta=489.4s
+[run] pair 4/50 (8.0%)  elapsed=37.3s  eta=429.5s
+[run] pair 6/50 (12.0%)  elapsed=55.5s  eta=407.2s
+[run] pair 8/50 (16.0%)  elapsed=76.1s  eta=399.6s
+[run] pair 10/50 (20.0%)  elapsed=95.2s  eta=380.8s
+[run] pair 12/50 (24.0%)  elapsed=113.2s  eta=358.4s
+[run] pair 14/50 (28.0%)  elapsed=131.7s  eta=338.7s
+[run] pair 16/50 (32.0%)  elapsed=149.8s  eta=318.4s
+[run] pair 18/50 (36.0%)  elapsed=167.8s  eta=298.2s
+[run] pair 20/50 (40.0%)  elapsed=185.4s  eta=278.2s
+[run] pair 22/50 (44.0%)  elapsed=204.9s  eta=260.8s
+[run] pair 24/50 (48.0%)  elapsed=225.3s  eta=244.1s
+[run] pair 26/50 (52.0%)  elapsed=243.1s  eta=224.4s
+[run] pair 28/50 (56.0%)  elapsed=261.1s  eta=205.2s
+[run] pair 30/50 (60.0%)  elapsed=279.9s  eta=186.6s
+[run] pair 32/50 (64.0%)  elapsed=298.1s  eta=167.7s
+[run] pair 34/50 (68.0%)  elapsed=317.5s  eta=149.4s
+[run] pair 36/50 (72.0%)  elapsed=335.4s  eta=130.4s
+[run] pair 38/50 (76.0%)  elapsed=355.5s  eta=112.3s
+[run] pair 40/50 (80.0%)  elapsed=375.1s  eta=93.8s
+[run] pair 42/50 (84.0%)  elapsed=394.8s  eta=75.2s
+[run] pair 44/50 (88.0%)  elapsed=413.1s  eta=56.3s
+[run] pair 46/50 (92.0%)  elapsed=431.8s  eta=37.5s
+[run] pair 48/50 (96.0%)  elapsed=452.4s  eta=18.8s
+[run] pair 50/50 (100.0%)  elapsed=473.2s  eta=0.0s
+[run] wrote experiments/attention_patching/results/patch_EleutherAI_pythia-410m_N50_T128_20260417_135437.parquet  (6350 rows)
+[run] wrote experiments/attention_patching/results/patch_EleutherAI_pythia-410m_N50_T128_20260417_135437.json
+{
+  "model_name": "EleutherAI/pythia-410m",
+  "num_pairs": 50,
+  "max_length": 128,
+  "seed": 42,
+  "wasserstein_k": 256,
+  "skip_wasserstein": false,
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "dataset_name": "sample-10BT",
+  "n_rows": 6350,
+  "rank_top1_a1_in_a2": {
+    "mean": 1201.495590551181,
+    "median": 9.0,
+    "std": 4294.4522512754165
+  },
+  "kl_a1_a2": {
+    "mean": 3.535181009248339,
+    "median": 3.174765467643738,
+    "std": 2.3218340338991994
+  },
+  "js_a1_a2": {
+    "mean": 0.450029494298666,
+    "median": 0.4863089323043823,
+    "std": 0.16306176273052833
+  },
+  "tvd_a1_a2": {
+    "mean": 0.7797341921309552,
+    "median": 0.8377766609191895,
+    "std": 0.18290779941825883
+  },
+  "kl_a1_aprime": {
+    "mean": 9.466349745805807,
+    "median": 8.953856468200684,
+    "std": 4.096548524215285
+  },
+  "js_a1_aprime": {
+    "mean": 0.6325749026139186,
+    "median": 0.6654211282730103,
+    "std": 0.08755665599995859
+  },
+  "tvd_a1_aprime": {
+    "mean": 0.9507224579636506,
+    "median": 0.9814953207969666,
+    "std": 0.08691289885294234
+  },
+  "entropy_a1": {
+    "mean": 3.212845785225353,
+    "median": 3.246654510498047,
+    "std": 1.6853500197592666
+  },
+  "entropy_a2": {
+    "mean": 6.1231468461758976,
+    "median": 6.081199645996094,
+    "std": 2.2384716284324173
+  },
+  "wasserstein_a1_a2": {
+    "mean": 0.6408695063009251,
+    "median": 0.6662816064835324,
+    "std": 0.194979625709799
+  },
+  "wasserstein_a1_aprime": {
+    "mean": 0.8322790775528278,
+    "median": 0.8708228030233722,
+    "std": 0.1302523208234203
+  },
+  "rank_cdf": {
+    "1": 0.1941732283464567,
+    "5": 0.42346456692913387,
+    "10": 0.5132283464566929,
+    "50": 0.6664566929133858,
+    "100": 0.7193700787401575
+  },
+  "R_kl": 0.37344711574962125,
+  "R_js": 0.7114248327574481,
+  "R_tvd": 0.8201491251201379,
+  "R_wasserstein": 0.7700175621202574
+}

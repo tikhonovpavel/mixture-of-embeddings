@@ -19,6 +19,8 @@ import math
 import os
 import sys
 import random
+import queue
+import threading
 from datetime import datetime
 from typing import List, Dict, Tuple, Iterator, Optional
 
@@ -165,6 +167,30 @@ def _forward_layers(blocks, hidden_states, start, end, position_embeddings=None)
 # Data helpers (same as train_split_projections)
 # ---------------------------------------------------------------------------
 
+def _prefetch_iterator(iterator: Iterator, maxsize: int = 4) -> Iterator:
+    """Wraps an iterator with a background thread that prefetches batches.
+
+    Allows data loading / tokenization to overlap with GPU compute.
+    """
+    q: queue.Queue = queue.Queue(maxsize=maxsize)
+    _sentinel = object()
+
+    def _worker():
+        try:
+            for item in iterator:
+                q.put(item)
+        finally:
+            q.put(_sentinel)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    while True:
+        item = q.get()
+        if item is _sentinel:
+            break
+        yield item
+
+
 def _tokenized_pair_iterator(
     dataset, tokenizer, max_length: int, batch_size: int = 1,
 ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
@@ -217,12 +243,21 @@ def train(
     lambada_interval: int = 10_000,
     num_lambada_pairs: int = 500,
     # scheduler
-    scheduler_type: str = "plateau",  # "cosine" or "plateau"
-    plateau_patience: int = 5,        # in units of lambada_interval
+    scheduler_type: str = "plateau_windowed",  # "cosine", "plateau", or "plateau_windowed"
+    plateau_patience: int = 5,        # for "plateau": in units of lambada_interval
     plateau_factor: float = 0.5,
     plateau_threshold: float = 0.005,
+    plateau_window: int = 5,          # for "plateau_windowed": window size in units of lambada evals
+    # loss balancing
+    use_loss_balancing: bool = True,
+    loss_balance_strength: float = 5.0,
+    loss_balance_ema_momentum: float = 0.99,
+    loss_balance_warmup_steps: int = 100,
+    loss_balance_clip_min: float = 0.1,
+    loss_balance_clip_max: float = 10.0,
     # resume
     resume_from: str = "",            # path to checkpoint or run dir
+    resume_warmup_steps: int = 200,   # linear LR warmup after resume
     # misc
     seed: int = 42,
     dtype: str = "auto",
@@ -270,9 +305,7 @@ def train(
           f"split_layer={split_layer} (separate last {split_before_end})")
     print(f"Hidden dim: {hidden_dim},  dtype: {model_dtype}")
 
-    # Gradient checkpointing: recompute activations to save memory
-    model.gradient_checkpointing_enable()
-    print("Gradient checkpointing: enabled")
+    print("Gradient checkpointing: disabled (sufficient VRAM available)")
 
     # Unfreeze backbone
     model.train()
@@ -318,8 +351,19 @@ def train(
             optimizer, mode="max", factor=plateau_factor,
             patience=plateau_patience, threshold=plateau_threshold,
         )
+    elif scheduler_type == "plateau_windowed":
+        scheduler = None
     else:
         raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
+
+    # Windowed plateau state
+    lambada_acc_history: List[float] = []
+
+    # Loss balancing state
+    ema_loss_a: Optional[float] = None
+    ema_loss_b: Optional[float] = None
+    balance_alpha = 1.0
+    balance_beta = 1.0
 
     # ------------------------------------------------------------------
     # Resume from checkpoint
@@ -343,7 +387,6 @@ def train(
         marking.load_state_dict(ckpt["marking"])
         split_proj.load_state_dict(ckpt["split_proj"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        # Update optimizer LRs to new values (checkpoint may have decayed LRs)
         for pg in optimizer.param_groups:
             if pg is optimizer.param_groups[0]:
                 pg["lr"] = lr_backbone
@@ -351,9 +394,23 @@ def train(
                 pg["lr"] = lr_projections
         if scheduler_type == "cosine" and "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
+        if "ema_loss_a" in ckpt:
+            ema_loss_a = ckpt["ema_loss_a"]
+            ema_loss_b = ckpt["ema_loss_b"]
+            balance_alpha = ckpt.get("balance_alpha", 1.0)
+            balance_beta = ckpt.get("balance_beta", 1.0)
+            print(f"Restored loss balancing: ema_A={ema_loss_a:.4f}, ema_B={ema_loss_b:.4f}, "
+                  f"alpha={balance_alpha:.4f}, beta={balance_beta:.4f}")
+        if "lambada_acc_history" in ckpt:
+            lambada_acc_history = ckpt["lambada_acc_history"]
+            print(f"Restored lambada_acc_history: {len(lambada_acc_history)} entries")
         start_step = ckpt["step"]
         print(f"Resumed at step {start_step}, LRs reset to backbone={lr_backbone}, proj={lr_projections}")
+        print(f"Resume warmup: {resume_warmup_steps} steps")
         del ckpt
+
+    do_resume_warmup = bool(resume_from) and resume_warmup_steps > 0
+    resume_target_lrs = [lr_backbone, lr_projections]
 
     # ------------------------------------------------------------------
     # Data
@@ -362,7 +419,10 @@ def train(
     print(f"Batch size: {batch_size},  max_length: {max_length},  grad_accum: {grad_accum}")
     ds = load_dataset(dataset_name, dataset_config, split=dataset_split, streaming=streaming)
     ds = ds.shuffle(seed=seed, buffer_size=5000)
-    train_iter = _tokenized_pair_iterator(ds, tokenizer, max_length, batch_size=batch_size)
+    train_iter = _prefetch_iterator(
+        _tokenized_pair_iterator(ds, tokenizer, max_length, batch_size=batch_size),
+        maxsize=8,
+    )
 
     print("Preparing evaluation set...")
     eval_ds = load_dataset(dataset_name, dataset_config, split=dataset_split, streaming=streaming)
@@ -420,8 +480,18 @@ def train(
         max_grad_norm=max_grad_norm, init_noise_std=init_noise_std,
         seed=seed, mark_params=mark_params, split_params=split_params,
         lambada_interval=lambada_interval, num_lambada_pairs=num_lambada_pairs,
+        scheduler_type=scheduler_type, plateau_window=plateau_window,
+        plateau_factor=plateau_factor, plateau_threshold=plateau_threshold,
+        use_loss_balancing=use_loss_balancing,
+        loss_balance_strength=loss_balance_strength,
+        loss_balance_ema_momentum=loss_balance_ema_momentum,
+        resume_warmup_steps=resume_warmup_steps,
     )
-    with open(os.path.join(run_dir, "config.json"), "w") as f:
+    config_path = os.path.join(run_dir, "config.json")
+    if resume_from and os.path.exists(config_path):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        config_path = os.path.join(run_dir, f"config_resumed_{ts}.json")
+    with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
     # ------------------------------------------------------------------
@@ -480,13 +550,32 @@ def train(
 
         return logits_a, logits_b
 
+    def _update_loss_balancing(la_val: float, lb_val: float, step: int):
+        nonlocal ema_loss_a, ema_loss_b, balance_alpha, balance_beta
+        if not use_loss_balancing:
+            return
+        if ema_loss_a is None:
+            ema_loss_a = la_val
+            ema_loss_b = lb_val
+        else:
+            ema_loss_a = loss_balance_ema_momentum * ema_loss_a + (1 - loss_balance_ema_momentum) * la_val
+            ema_loss_b = loss_balance_ema_momentum * ema_loss_b + (1 - loss_balance_ema_momentum) * lb_val
+        if step >= loss_balance_warmup_steps and ema_loss_a is not None:
+            total = ema_loss_a + ema_loss_b
+            w_a = (ema_loss_a / total) ** loss_balance_strength
+            w_b = (ema_loss_b / total) ** loss_balance_strength
+            norm = w_a + w_b
+            balance_alpha = max(loss_balance_clip_min, min(loss_balance_clip_max, w_a / norm * 2.0))
+            balance_beta = max(loss_balance_clip_min, min(loss_balance_clip_max, w_b / norm * 2.0))
+
     def _compute_loss(ids_a, ids_b):
         logits_a, logits_b = _forward_split_merge(ids_a, ids_b)
         la = loss_fn(logits_a[:, :-1].contiguous().view(-1, logits_a.size(-1)),
                      ids_a[:, 1:].contiguous().view(-1).to(logits_a.device))
         lb = loss_fn(logits_b[:, :-1].contiguous().view(-1, logits_b.size(-1)),
                      ids_b[:, 1:].contiguous().view(-1).to(logits_b.device))
-        return 0.5 * (la + lb), la.item(), lb.item()
+        loss = 0.5 * (balance_alpha * la + balance_beta * lb)
+        return loss, la.item(), lb.item()
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -660,15 +749,22 @@ def train(
     # Checkpoint helper
     # ------------------------------------------------------------------
     def _save_checkpoint(path: str, step: int):
-        torch.save({
+        ckpt_data = {
             "step": step,
             "model": model.state_dict(),
             "marking": marking.state_dict(),
             "split_proj": split_proj.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
             "scheduler_type": scheduler_type,
-        }, path)
+            "ema_loss_a": ema_loss_a,
+            "ema_loss_b": ema_loss_b,
+            "balance_alpha": balance_alpha,
+            "balance_beta": balance_beta,
+            "lambada_acc_history": lambada_acc_history,
+        }
+        if scheduler is not None:
+            ckpt_data["scheduler"] = scheduler.state_dict()
+        torch.save(ckpt_data, path)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -682,7 +778,12 @@ def train(
     print(f"Training split/merge  K={K}, M={split_before_end}  "
           f"for {num_train_steps} steps (starting from {start_step})")
     print(f"LR backbone={lr_backbone},  LR projections={lr_projections}")
-    print(f"Scheduler: {scheduler_type}")
+    print(f"Scheduler: {scheduler_type}"
+          + (f" (window={plateau_window}, factor={plateau_factor}, threshold={plateau_threshold})"
+             if scheduler_type == "plateau_windowed" else ""))
+    print(f"Loss balancing: {use_loss_balancing}"
+          + (f" (strength={loss_balance_strength}, ema={loss_balance_ema_momentum})"
+             if use_loss_balancing else ""))
     print(f"Batch size: {batch_size},  grad_accum: {grad_accum},  "
           f"effective batch: {batch_size * grad_accum}")
     print(f"{'='*90}")
@@ -708,13 +809,17 @@ def train(
         except StopIteration:
             ds = load_dataset(dataset_name, dataset_config, split=dataset_split, streaming=streaming)
             ds = ds.shuffle(seed=seed + step, buffer_size=5000)
-            train_iter = _tokenized_pair_iterator(ds, tokenizer, max_length, batch_size=batch_size)
+            train_iter = _prefetch_iterator(
+                _tokenized_pair_iterator(ds, tokenizer, max_length, batch_size=batch_size),
+                maxsize=8,
+            )
             ids_a, ids_b = next(train_iter)
 
         ids_a = ids_a.to(device)
         ids_b = ids_b.to(device)
 
         loss, la, lb = _compute_loss(ids_a, ids_b)
+        _update_loss_balancing(la, lb, step)
         (loss / grad_accum).backward()
         accum_count += 1
 
@@ -726,6 +831,13 @@ def train(
             optimizer.step()
             if scheduler_type == "cosine":
                 scheduler.step()
+            if do_resume_warmup and (step - start_step) <= resume_warmup_steps:
+                warmup_factor = (step - start_step) / max(resume_warmup_steps, 1)
+                for i, pg in enumerate(optimizer.param_groups):
+                    if scheduler_type == "cosine":
+                        pg["lr"] *= warmup_factor
+                    else:
+                        pg["lr"] = resume_target_lrs[i] * warmup_factor
             optimizer.zero_grad()
             accum_count = 0
 
@@ -735,13 +847,21 @@ def train(
             avg = running_loss / log_interval
             cur_lr_bb = optimizer.param_groups[0]["lr"]
             cur_lr_proj = optimizer.param_groups[1]["lr"]
-            print(f"[Step {step:>5d}] loss={avg:.4f}  (A={la:.4f} B={lb:.4f})  "
+            loss_ratio = la / max(lb, 1e-8)
+            print(f"[Step {step:>5d}] loss={avg:.4f}  (A={la:.4f} B={lb:.4f} ratio={loss_ratio:.3f})  "
+                  f"α={balance_alpha:.3f} β={balance_beta:.3f}  "
                   f"lr_bb={cur_lr_bb:.2e}  lr_proj={cur_lr_proj:.2e}")
             sys.stdout.flush()
             train_losses.append({"step": step, "loss": avg, "loss_a": la, "loss_b": lb})
             writer.add_scalar("train/loss", avg, step)
             writer.add_scalar("train/loss_a", la, step)
             writer.add_scalar("train/loss_b", lb, step)
+            writer.add_scalar("train/loss_ratio_a_over_b", loss_ratio, step)
+            writer.add_scalar("train/balance_alpha", balance_alpha, step)
+            writer.add_scalar("train/balance_beta", balance_beta, step)
+            if ema_loss_a is not None:
+                writer.add_scalar("train/ema_loss_a", ema_loss_a, step)
+                writer.add_scalar("train/ema_loss_b", ema_loss_b, step)
             writer.add_scalar("lr/backbone", cur_lr_bb, step)
             writer.add_scalar("lr/projections", cur_lr_proj, step)
             running_loss = 0.0
@@ -770,6 +890,27 @@ def train(
                 new_lr = optimizer.param_groups[0]["lr"]
                 if new_lr < old_lr:
                     print(f"  -> ReduceLROnPlateau: LR reduced {old_lr:.2e} -> {new_lr:.2e}")
+            elif scheduler_type == "plateau_windowed":
+                lambada_acc_history.append(lambada_res["acc_avg"])
+                w = plateau_window
+                if len(lambada_acc_history) >= 2 * w:
+                    recent_mean = np.mean(lambada_acc_history[-w:])
+                    previous_mean = np.mean(lambada_acc_history[-2*w:-w])
+                    improved = recent_mean > previous_mean * (1 + plateau_threshold)
+                    writer.add_scalar("scheduler/recent_window_mean", recent_mean, step)
+                    writer.add_scalar("scheduler/previous_window_mean", previous_mean, step)
+                    if not improved:
+                        old_lr = optimizer.param_groups[0]["lr"]
+                        for pg in optimizer.param_groups:
+                            pg["lr"] *= plateau_factor
+                        new_lr = optimizer.param_groups[0]["lr"]
+                        print(f"  -> Windowed plateau: no improvement "
+                              f"(recent={recent_mean:.4f} vs prev={previous_mean:.4f}), "
+                              f"LR reduced {old_lr:.2e} -> {new_lr:.2e}")
+                        lambada_acc_history.clear()
+                    else:
+                        print(f"  -> Windowed plateau: improved "
+                              f"(recent={recent_mean:.4f} vs prev={previous_mean:.4f})")
 
     # ------------------------------------------------------------------
     # Save results

@@ -1,0 +1,109 @@
+[run] model=Qwen/Qwen2.5-3B
+[run] patch_mode=permutation
+[run] num_pairs=60  T=128
+[run] saving to experiments/attention_patching/results/patch_permutation_Qwen_Qwen2.5-3B_N60_T128_20260417_154903.{parquet,json}
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/434 [00:00<?, ?it/s]Loading weights:   0%|          | 1/434 [00:02<19:00,  2.63s/it]Loading weights:   1%|          | 3/434 [00:03<07:03,  1.02it/s]Loading weights:   1%|          | 5/434 [00:03<03:39,  1.95it/s]Loading weights:   3%|▎         | 15/434 [00:04<01:14,  5.66it/s]Loading weights:   4%|▍         | 17/434 [00:04<01:05,  6.36it/s]Loading weights:   6%|▌         | 27/434 [00:05<00:47,  8.51it/s]Loading weights:   7%|▋         | 29/434 [00:05<00:44,  9.02it/s]Loading weights:   9%|▉         | 38/434 [00:06<00:40,  9.68it/s]Loading weights:   9%|▉         | 41/434 [00:06<00:36, 10.78it/s]Loading weights:  12%|█▏        | 51/434 [00:07<00:34, 11.26it/s]Loading weights:  12%|█▏        | 53/434 [00:07<00:33, 11.44it/s]Loading weights:  15%|█▍        | 63/434 [00:08<00:31, 11.66it/s]Loading weights:  15%|█▍        | 65/434 [00:08<00:31, 11.90it/s]Loading weights:  17%|█▋        | 75/434 [00:09<00:30, 11.90it/s]Loading weights:  18%|█▊        | 77/434 [00:09<00:29, 12.14it/s]Loading weights:  20%|██        | 88/434 [00:10<00:28, 12.01it/s]Loading weights:  22%|██▏       | 97/434 [00:10<00:19, 17.37it/s]Loading weights:  23%|██▎       | 101/434 [00:11<00:30, 10.99it/s]Loading weights:  26%|██▌       | 112/434 [00:12<00:28, 11.33it/s]Loading weights:  27%|██▋       | 119/434 [00:12<00:21, 14.70it/s]Loading weights:  29%|██▊       | 124/434 [00:13<00:28, 10.85it/s]Loading weights:  30%|██▉       | 130/434 [00:13<00:21, 13.96it/s]Loading weights:  31%|███▏      | 136/434 [00:14<00:28, 10.36it/s]Loading weights:  34%|███▍      | 148/434 [00:15<00:25, 11.40it/s]Loading weights:  37%|███▋      | 159/434 [00:15<00:16, 16.46it/s]Loading weights:  38%|███▊      | 163/434 [00:16<00:23, 11.45it/s]Loading weights:  39%|███▉      | 171/434 [00:16<00:16, 15.49it/s]Loading weights:  40%|████      | 175/434 [00:17<00:24, 10.73it/s]Loading weights:  42%|████▏     | 184/434 [00:18<00:24, 10.36it/s]Loading weights:  44%|████▍     | 193/434 [00:18<00:16, 14.94it/s]Loading weights:  46%|████▌     | 198/434 [00:19<00:22, 10.62it/s]Loading weights:  48%|████▊     | 208/434 [00:20<00:21, 10.72it/s]Loading weights:  50%|█████     | 219/434 [00:20<00:13, 15.65it/s]Loading weights:  51%|█████▏    | 223/434 [00:21<00:19, 11.09it/s]Loading weights:  53%|█████▎    | 231/434 [00:21<00:13, 14.73it/s]Loading weights:  54%|█████▍    | 235/434 [00:22<00:18, 10.66it/s]Loading weights:  56%|█████▌    | 243/434 [00:22<00:12, 15.02it/s]Loading weights:  57%|█████▋    | 247/434 [00:23<00:17, 10.52it/s]Loading weights:  59%|█████▊    | 254/434 [00:23<00:12, 14.30it/s]Loading weights:  59%|█████▉    | 258/434 [00:23<00:10, 16.32it/s]Loading weights:  62%|██████▏   | 267/434 [00:24<00:12, 13.91it/s]Loading weights:  62%|██████▏   | 270/434 [00:24<00:11, 14.55it/s]Loading weights:  64%|██████▍   | 278/434 [00:25<00:12, 12.13it/s]Loading weights:  65%|██████▍   | 281/434 [00:25<00:11, 13.16it/s]Loading weights:  67%|██████▋   | 291/434 [00:26<00:11, 12.41it/s]Loading weights:  68%|██████▊   | 293/434 [00:26<00:11, 12.56it/s]Loading weights:  70%|██████▉   | 303/434 [00:27<00:10, 12.20it/s]Loading weights:  70%|███████   | 305/434 [00:27<00:10, 12.35it/s]Loading weights:  73%|███████▎  | 315/434 [00:28<00:09, 12.07it/s]Loading weights:  73%|███████▎  | 317/434 [00:28<00:09, 12.10it/s]Loading weights:  75%|███████▌  | 327/434 [00:29<00:08, 12.09it/s]Loading weights:  76%|███████▌  | 329/434 [00:29<00:08, 12.24it/s]Loading weights:  83%|████████▎ | 361/434 [00:29<00:01, 39.93it/s]Loading weights: 100%|██████████| 434/434 [00:29<00:00, 14.62it/s]
+Some parameters are on the meta device because they were offloaded to the cpu.
+[data] streaming HuggingFaceFW/fineweb-edu/sample-10BT ...
+[data] got 180 raw texts; tokenizing to T=128
+[run] pair 3/60 (5.0%)  elapsed=41.8s  eta=794.4s
+[run] pair 6/60 (10.0%)  elapsed=81.1s  eta=729.7s
+[run] pair 9/60 (15.0%)  elapsed=120.3s  eta=681.7s
+[run] pair 12/60 (20.0%)  elapsed=162.5s  eta=650.0s
+[run] pair 15/60 (25.0%)  elapsed=200.8s  eta=602.4s
+[run] pair 18/60 (30.0%)  elapsed=242.3s  eta=565.3s
+[run] pair 21/60 (35.0%)  elapsed=286.0s  eta=531.1s
+[run] pair 24/60 (40.0%)  elapsed=327.4s  eta=491.1s
+[run] pair 27/60 (45.0%)  elapsed=371.3s  eta=453.8s
+[run] pair 30/60 (50.0%)  elapsed=416.2s  eta=416.2s
+[run] pair 33/60 (55.0%)  elapsed=452.7s  eta=370.4s
+[run] pair 36/60 (60.0%)  elapsed=491.7s  eta=327.8s
+[run] pair 39/60 (65.0%)  elapsed=531.0s  eta=285.9s
+[run] pair 42/60 (70.0%)  elapsed=574.7s  eta=246.3s
+[run] pair 45/60 (75.0%)  elapsed=614.3s  eta=204.8s
+[run] pair 48/60 (80.0%)  elapsed=656.6s  eta=164.1s
+[run] pair 51/60 (85.0%)  elapsed=700.9s  eta=123.7s
+[run] pair 54/60 (90.0%)  elapsed=739.3s  eta=82.1s
+[run] pair 57/60 (95.0%)  elapsed=780.0s  eta=41.1s
+[run] pair 60/60 (100.0%)  elapsed=820.2s  eta=0.0s
+[run] wrote experiments/attention_patching/results/patch_permutation_Qwen_Qwen2.5-3B_N60_T128_20260417_154903.parquet  (7620 rows)
+[run] wrote experiments/attention_patching/results/patch_permutation_Qwen_Qwen2.5-3B_N60_T128_20260417_154903.json
+{
+  "model_name": "Qwen/Qwen2.5-3B",
+  "patch_mode": "permutation",
+  "num_pairs": 60,
+  "max_length": 128,
+  "seed": 42,
+  "wasserstein_k": 256,
+  "skip_wasserstein": false,
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "dataset_name": "sample-10BT",
+  "n_rows": 7620,
+  "rank_top1_a1_in_a2": {
+    "mean": 18142.951837270342,
+    "median": 1502.0,
+    "std": 33010.611461364846
+  },
+  "kl_a1_a2": {
+    "mean": 9.127834473268724,
+    "median": 8.475619316101074,
+    "std": 4.079952467768981
+  },
+  "js_a1_a2": {
+    "mean": 0.6428847932264091,
+    "median": 0.6665476560592651,
+    "std": 0.06743658948298913
+  },
+  "tvd_a1_a2": {
+    "mean": 0.9609244341485378,
+    "median": 0.9827494621276855,
+    "std": 0.06462225164682604
+  },
+  "kl_a1_aprime": {
+    "mean": 13.362513009013897,
+    "median": 12.899085998535156,
+    "std": 5.142257428819463
+  },
+  "js_a1_aprime": {
+    "mean": 0.6666461673957538,
+    "median": 0.6885055303573608,
+    "std": 0.0645673512190252
+  },
+  "tvd_a1_aprime": {
+    "mean": 0.9784928420925234,
+    "median": 0.9972100853919983,
+    "std": 0.06514224417071249
+  },
+  "entropy_a1": {
+    "mean": 2.2441050378654146,
+    "median": 2.1542491912841797,
+    "std": 1.5692480670301143
+  },
+  "entropy_a2": {
+    "mean": 5.365772473157,
+    "median": 5.510482311248779,
+    "std": 1.775681155902711
+  },
+  "wasserstein_a1_a2": {
+    "mean": 0.858665820014009,
+    "median": 0.8829375699387814,
+    "std": 0.15274591284893688
+  },
+  "wasserstein_a1_aprime": {
+    "mean": 0.9040450776820818,
+    "median": 0.9460947712179779,
+    "std": 0.14194354628938746
+  },
+  "rank_cdf": {
+    "1": 0.01994750656167979,
+    "5": 0.06443569553805774,
+    "10": 0.10131233595800525,
+    "50": 0.21758530183727035,
+    "100": 0.2727034120734908
+  },
+  "R_kl": 0.6830926538377472,
+  "R_js": 0.9643568427578783,
+  "R_tvd": 0.9820454405099016,
+  "R_wasserstein": 0.9498042091170692
+}

@@ -1,0 +1,47 @@
+# Attention-Patching Experiment: Report
+
+Setup: for each FineWeb text $A$ we replace every post-softmax attention map at every layer with the corresponding map from an unrelated donor text $C$. We keep $Q, K, V$ projections of $A$ intact; only the mixing weights change. No finetuning, no prompt manipulation.
+
+If the model is largely robust to this substitution, then 'mixed embeddings don't break attention' cannot be what makes superposition work in the main paper -- because attention was wholesale replaced with unrelated content here, and the model still tracked the right tokens.
+
+## Qwen/Qwen2.5-3B [donor]
+
+- rank(top-1 of A1) under A2: P(rank=1)=0.231, P(rank<=5)=0.447, P(rank<=10)=0.529, P(rank<=100)=0.742, median rank=8.0.
+
+- Superposition Approximation Ratio (patched vs. unrelated-text baseline): R_KL=0.270, R_JS=0.704, R_Wasserstein=0.729.
+
+- Entropy sanity: mean H(P_A1)=2.237 nats, mean H(P_A2)=6.261 nats (delta=+4.024; should not blow up if the patched distribution stays informative).
+
+## Qwen/Qwen2.5-3B [permutation]
+
+- rank(top-1 of A1) under A2: P(rank=1)=0.020, P(rank<=5)=0.064, P(rank<=10)=0.101, P(rank<=100)=0.273, median rank=1502.0.
+
+- Superposition Approximation Ratio (patched vs. unrelated-text baseline): R_KL=0.683, R_JS=0.964, R_Wasserstein=0.950.
+
+- Entropy sanity: mean H(P_A1)=2.244 nats, mean H(P_A2)=5.366 nats (delta=+3.122; should not blow up if the patched distribution stays informative).
+
+## EleutherAI/pythia-410m [donor]
+
+- rank(top-1 of A1) under A2: P(rank=1)=0.194, P(rank<=5)=0.423, P(rank<=10)=0.513, P(rank<=100)=0.719, median rank=9.0.
+
+- Superposition Approximation Ratio (patched vs. unrelated-text baseline): R_KL=0.373, R_JS=0.711, R_Wasserstein=0.770.
+
+- Entropy sanity: mean H(P_A1)=3.213 nats, mean H(P_A2)=6.123 nats (delta=+2.910; should not blow up if the patched distribution stays informative).
+
+## Summary table
+
+| model                          | condition                  |      KL |     JS |   Wasserstein |   R_KL |   R_JS |    R_W |   n_rows |
+|:-------------------------------|:---------------------------|--------:|-------:|--------------:|-------:|-------:|-------:|---------:|
+| Qwen/Qwen2.5-3B [donor]        | A2 (patched)               |  3.5395 | 0.4685 |        0.6563 | 0.2703 | 0.7041 | 0.729  |    12700 |
+| Qwen/Qwen2.5-3B [donor]        | A1 vs A' (random baseline) | 13.0955 | 0.6655 |        0.9003 | 1      | 1      | 1      |    12700 |
+| Qwen/Qwen2.5-3B [permutation]  | A2 (patched)               |  9.1278 | 0.6429 |        0.8587 | 0.6831 | 0.9644 | 0.9498 |     7620 |
+| Qwen/Qwen2.5-3B [permutation]  | A1 vs A' (random baseline) | 13.3625 | 0.6666 |        0.904  | 1      | 1      | 1      |     7620 |
+| EleutherAI/pythia-410m [donor] | A2 (patched)               |  3.5352 | 0.45   |        0.6409 | 0.3734 | 0.7114 | 0.77   |     6350 |
+| EleutherAI/pythia-410m [donor] | A1 vs A' (random baseline) |  9.4663 | 0.6326 |        0.8323 | 1      | 1      | 1      |     6350 |
+
+
+## Interpretation
+
+- If rank-CDF(A2) sits far above chance and R_* << 1, the output distribution remains close to the baseline even with fully unrelated attention maps. This empirically contradicts the folk explanation that superposition works because mixed embeddings induce 'almost-correct' attention; since here attention is explicitly wrong, yet predictions survive, the mechanism must live elsewhere (residual stream + MLP, plausibly also OV-circuits that don't care which particular query-key interaction fired).
+
+- If R_* approaches 1 and the rank CDF hugs the diagonal, the model relies heavily on content-specific attention and the superposition phenomenon cannot be explained without invoking it.
