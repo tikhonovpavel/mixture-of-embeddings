@@ -246,18 +246,30 @@ def train(
     scheduler_type: str = "plateau_windowed",  # "cosine", "plateau", or "plateau_windowed"
     plateau_patience: int = 5,        # for "plateau": in units of lambada_interval
     plateau_factor: float = 0.5,
-    plateau_threshold: float = 0.005,
-    plateau_window: int = 5,          # for "plateau_windowed": window size in units of lambada evals
+    plateau_threshold: float = 0.005, # LEGACY: used only for plateau_signal="lambada"
+    plateau_window: int = 5,          # LEGACY: used only for plateau_signal="lambada"
+    # scheduler — new eval_ce-based plateau
+    plateau_signal: str = "eval_ce",  # "eval_ce" (recommended) or "lambada"
+    plateau_window_evals: int = 20,   # window size in units of eval_interval (500 steps)
+    plateau_threshold_ce_abs: float = 0.003,  # absolute CE drop required per window
+    plateau_cooldown_evals: int = 40, # after a drop, skip decisions for N eval_interval's
     # loss balancing
     use_loss_balancing: bool = True,
+    balance_signal: str = "eval_ce",  # "eval_ce" (recommended) or "train_loss"
     loss_balance_strength: float = 5.0,
-    loss_balance_ema_momentum: float = 0.99,
-    loss_balance_warmup_steps: int = 100,
+    loss_balance_ema_momentum: float = 0.99,      # for train_loss signal (per-step EMA)
+    loss_balance_ema_momentum_eval: float = 0.9,  # for eval_ce signal (per-eval EMA)
+    loss_balance_warmup_steps: int = 100,         # train_loss-only: skip balance for first N steps
+    loss_balance_warmup_evals: int = 2,           # eval_ce-only: skip balance for first N evals
     loss_balance_clip_min: float = 0.1,
     loss_balance_clip_max: float = 10.0,
     # resume
-    resume_from: str = "",            # path to checkpoint or run dir
-    resume_warmup_steps: int = 200,   # linear LR warmup after resume
+    resume_from: str = "",               # path to checkpoint or run dir
+    resume_warmup_steps: int = 2000,     # linear LR warmup after resume
+    resume_reset_optimizer: bool = False, # drop Adam moments on resume (recommended if LR was reset from ~0)
+    # manual override + safety
+    override_check_interval: int = 100,  # poll run_dir/override.json every N steps
+    checkpoint_last_interval: int = 10_000,  # save checkpoint_last.pt every N steps (0 = only at end)
     # misc
     seed: int = 42,
     dtype: str = "auto",
@@ -271,6 +283,31 @@ def train(
         split_before_end: M — last M layers run separately per stream.
         lr_backbone:      LR for pretrained backbone parameters.
         lr_projections:   LR for marking + split projection parameters.
+
+    Manual override mechanism:
+        Write a JSON file to {run_dir}/override.json. Every
+        `override_check_interval` steps the training loop reads it, applies
+        the fields, appends a record to {run_dir}/override_applied.jsonl, and
+        renames the file to override.applied_<ts>.json. Supported keys:
+
+          "lr_backbone":              float   — set optimizer param_group[0] lr directly
+          "lr_projections":           float   — set optimizer param_group[1] lr directly
+          "balance_alpha":            float   — set current balance_alpha directly
+          "balance_beta":             float   — set current balance_beta directly
+          "plateau_enabled":          bool    — turn eval_ce plateau detector on/off
+          "use_loss_balancing":       bool    — turn auto-balance on/off
+          "plateau_factor":           float   — change next drop magnitude
+          "plateau_threshold_ce_abs": float   — change plateau threshold
+          "plateau_window_evals":     int     — change window length
+          "plateau_cooldown_evals":   int     — change cooldown length (for future drops)
+          "plateau_cooldown_until":   int     — set absolute step until which plateau is frozen
+          "num_train_steps":          int     — new total training steps (recomputes target)
+          "target_last_step":         int     — absolute step to train until (overrides num_train_steps)
+
+        Overrides affect ONLY the listed fields. EMA, eval history, optimizer
+        moments, etc. are untouched. If you override LR and want it to stick,
+        also set `"plateau_enabled": false` or a large `plateau_cooldown_until`,
+        otherwise the plateau detector may reduce it on the next eval.
     """
     torch.manual_seed(seed)
     random.seed(seed)
@@ -356,14 +393,19 @@ def train(
     else:
         raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
 
-    # Windowed plateau state
+    # Windowed plateau state (legacy: LAMBADA-based)
     lambada_acc_history: List[float] = []
+    # Windowed plateau state (new: eval_ce-based)
+    eval_ce_history: List[float] = []
+    plateau_cooldown_until: int = 0
+    plateau_enabled: bool = True      # can be flipped via override file
 
     # Loss balancing state
     ema_loss_a: Optional[float] = None
     ema_loss_b: Optional[float] = None
     balance_alpha = 1.0
     balance_beta = 1.0
+    balance_eval_count: int = 0       # how many eval_ce samples seen (for eval_ce warmup)
 
     # ------------------------------------------------------------------
     # Resume from checkpoint
@@ -373,11 +415,15 @@ def train(
     if resume_from:
         ckpt_path = resume_from
         if os.path.isdir(resume_from):
-            # It's a run directory — find the best checkpoint to resume from
+            # REFUSE to pick silently — this has already cost a 420k-step run.
             best_pt = os.path.join(resume_from, "checkpoint_best.pt")
             last_pt = os.path.join(resume_from, "checkpoint_last.pt")
-            ckpt_path = last_pt if os.path.exists(last_pt) else best_pt
-            resume_run_dir = resume_from
+            candidates = [p for p in (best_pt, last_pt) if os.path.exists(p)]
+            raise ValueError(
+                "resume_from is a directory; I won't guess which checkpoint to load. "
+                "Pass an explicit file path. Available in this dir:\n  "
+                + "\n  ".join(candidates)
+            )
         elif os.path.isfile(resume_from):
             resume_run_dir = os.path.dirname(resume_from)
 
@@ -386,7 +432,10 @@ def train(
         model.load_state_dict(ckpt["model"])
         marking.load_state_dict(ckpt["marking"])
         split_proj.load_state_dict(ckpt["split_proj"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        if resume_reset_optimizer:
+            print("  resume_reset_optimizer=True: fresh AdamW (discarding old Adam moments)")
+        else:
+            optimizer.load_state_dict(ckpt["optimizer"])
         for pg in optimizer.param_groups:
             if pg is optimizer.param_groups[0]:
                 pg["lr"] = lr_backbone
@@ -394,16 +443,33 @@ def train(
                 pg["lr"] = lr_projections
         if scheduler_type == "cosine" and "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
-        if "ema_loss_a" in ckpt:
+        # Restore loss-balance EMA only if signal matches old run (same scale).
+        # If balance_signal="eval_ce" now but old ckpt was train_loss-based, the
+        # EMA magnitudes are compatible (both are CE) but we still prefer to
+        # re-init from the first eval to avoid carrying over a stale EMA across
+        # warmup; tweak here if you want to preserve.
+        ckpt_balance_signal = ckpt.get("balance_signal", "train_loss")
+        if "ema_loss_a" in ckpt and ckpt["ema_loss_a"] is not None \
+                and ckpt_balance_signal == balance_signal:
             ema_loss_a = ckpt["ema_loss_a"]
             ema_loss_b = ckpt["ema_loss_b"]
             balance_alpha = ckpt.get("balance_alpha", 1.0)
             balance_beta = ckpt.get("balance_beta", 1.0)
-            print(f"Restored loss balancing: ema_A={ema_loss_a:.4f}, ema_B={ema_loss_b:.4f}, "
+            balance_eval_count = ckpt.get("balance_eval_count", 0)
+            print(f"  Restored loss balancing ({balance_signal}): "
+                  f"ema_A={ema_loss_a:.4f}, ema_B={ema_loss_b:.4f}, "
                   f"alpha={balance_alpha:.4f}, beta={balance_beta:.4f}")
-        if "lambada_acc_history" in ckpt:
+        else:
+            print(f"  Loss balancing reset (ckpt signal={ckpt_balance_signal!r}, new={balance_signal!r})")
+        if "lambada_acc_history" in ckpt and plateau_signal == "lambada":
             lambada_acc_history = ckpt["lambada_acc_history"]
-            print(f"Restored lambada_acc_history: {len(lambada_acc_history)} entries")
+            print(f"  Restored lambada_acc_history: {len(lambada_acc_history)} entries")
+        if "eval_ce_history" in ckpt and plateau_signal == "eval_ce":
+            eval_ce_history = ckpt["eval_ce_history"]
+            plateau_cooldown_until = ckpt.get("plateau_cooldown_until", 0)
+            plateau_enabled = ckpt.get("plateau_enabled", True)
+            print(f"  Restored eval_ce_history: {len(eval_ce_history)} entries, "
+                  f"cooldown_until={plateau_cooldown_until}, enabled={plateau_enabled}")
         start_step = ckpt["step"]
         print(f"Resumed at step {start_step}, LRs reset to backbone={lr_backbone}, proj={lr_projections}")
         print(f"Resume warmup: {resume_warmup_steps} steps")
@@ -479,13 +545,26 @@ def train(
         weight_decay=weight_decay, warmup_steps=warmup_steps,
         max_grad_norm=max_grad_norm, init_noise_std=init_noise_std,
         seed=seed, mark_params=mark_params, split_params=split_params,
+        eval_interval=eval_interval,
         lambada_interval=lambada_interval, num_lambada_pairs=num_lambada_pairs,
-        scheduler_type=scheduler_type, plateau_window=plateau_window,
-        plateau_factor=plateau_factor, plateau_threshold=plateau_threshold,
+        scheduler_type=scheduler_type,
+        plateau_signal=plateau_signal,
+        plateau_window_evals=plateau_window_evals,
+        plateau_threshold_ce_abs=plateau_threshold_ce_abs,
+        plateau_cooldown_evals=plateau_cooldown_evals,
+        plateau_factor=plateau_factor,
+        plateau_window=plateau_window,
+        plateau_threshold=plateau_threshold,
         use_loss_balancing=use_loss_balancing,
+        balance_signal=balance_signal,
         loss_balance_strength=loss_balance_strength,
         loss_balance_ema_momentum=loss_balance_ema_momentum,
+        loss_balance_ema_momentum_eval=loss_balance_ema_momentum_eval,
+        loss_balance_warmup_evals=loss_balance_warmup_evals,
         resume_warmup_steps=resume_warmup_steps,
+        resume_reset_optimizer=resume_reset_optimizer,
+        override_check_interval=override_check_interval,
+        checkpoint_last_interval=checkpoint_last_interval,
     )
     config_path = os.path.join(run_dir, "config.json")
     if resume_from and os.path.exists(config_path):
@@ -550,23 +629,59 @@ def train(
 
         return logits_a, logits_b
 
-    def _update_loss_balancing(la_val: float, lb_val: float, step: int):
-        nonlocal ema_loss_a, ema_loss_b, balance_alpha, balance_beta
-        if not use_loss_balancing:
+    def _recompute_balance():
+        """Recompute balance_alpha, balance_beta from current EMA values."""
+        nonlocal balance_alpha, balance_beta
+        if ema_loss_a is None or ema_loss_b is None:
             return
+        total = ema_loss_a + ema_loss_b
+        w_a = (ema_loss_a / total) ** loss_balance_strength
+        w_b = (ema_loss_b / total) ** loss_balance_strength
+        norm = w_a + w_b
+        balance_alpha = max(loss_balance_clip_min, min(loss_balance_clip_max, w_a / norm * 2.0))
+        balance_beta = max(loss_balance_clip_min, min(loss_balance_clip_max, w_b / norm * 2.0))
+
+    def _update_balance_train_loss(la_val: float, lb_val: float, step: int):
+        """Per-step EMA update from train loss (legacy signal).
+
+        EMA is always maintained (so turning ``use_loss_balancing`` back on
+        via override is smooth). alpha/beta are only recomputed when the
+        balancer is actively enabled.
+        """
+        nonlocal ema_loss_a, ema_loss_b
+        if balance_signal != "train_loss":
+            return
+        mom = loss_balance_ema_momentum
         if ema_loss_a is None:
             ema_loss_a = la_val
             ema_loss_b = lb_val
         else:
-            ema_loss_a = loss_balance_ema_momentum * ema_loss_a + (1 - loss_balance_ema_momentum) * la_val
-            ema_loss_b = loss_balance_ema_momentum * ema_loss_b + (1 - loss_balance_ema_momentum) * lb_val
-        if step >= loss_balance_warmup_steps and ema_loss_a is not None:
-            total = ema_loss_a + ema_loss_b
-            w_a = (ema_loss_a / total) ** loss_balance_strength
-            w_b = (ema_loss_b / total) ** loss_balance_strength
-            norm = w_a + w_b
-            balance_alpha = max(loss_balance_clip_min, min(loss_balance_clip_max, w_a / norm * 2.0))
-            balance_beta = max(loss_balance_clip_min, min(loss_balance_clip_max, w_b / norm * 2.0))
+            ema_loss_a = mom * ema_loss_a + (1 - mom) * la_val
+            ema_loss_b = mom * ema_loss_b + (1 - mom) * lb_val
+        if use_loss_balancing and step >= loss_balance_warmup_steps:
+            _recompute_balance()
+
+    def _update_balance_eval_ce(ce_a_val: float, ce_b_val: float):
+        """Per-eval EMA update from eval CE (new signal, cleaner + lower-noise).
+
+        EMA is always maintained; alpha/beta only change when balancing is enabled.
+        """
+        nonlocal ema_loss_a, ema_loss_b, balance_eval_count
+        if balance_signal != "eval_ce":
+            return
+        balance_eval_count += 1
+        mom = loss_balance_ema_momentum_eval
+        if ema_loss_a is None:
+            # First sample: initialize EMA but do not apply balance yet —
+            # we'd rather wait loss_balance_warmup_evals samples to build a
+            # stable estimate before touching alpha/beta.
+            ema_loss_a = ce_a_val
+            ema_loss_b = ce_b_val
+            return
+        ema_loss_a = mom * ema_loss_a + (1 - mom) * ce_a_val
+        ema_loss_b = mom * ema_loss_b + (1 - mom) * ce_b_val
+        if use_loss_balancing and balance_eval_count >= loss_balance_warmup_evals:
+            _recompute_balance()
 
     def _compute_loss(ids_a, ids_b):
         logits_a, logits_b = _forward_split_merge(ids_a, ids_b)
@@ -756,11 +871,17 @@ def train(
             "split_proj": split_proj.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler_type": scheduler_type,
+            "balance_signal": balance_signal,
             "ema_loss_a": ema_loss_a,
             "ema_loss_b": ema_loss_b,
             "balance_alpha": balance_alpha,
             "balance_beta": balance_beta,
+            "balance_eval_count": balance_eval_count,
             "lambada_acc_history": lambada_acc_history,
+            "eval_ce_history": eval_ce_history,
+            "plateau_cooldown_until": plateau_cooldown_until,
+            "plateau_enabled": plateau_enabled,
+            "plateau_signal": plateau_signal,
         }
         if scheduler is not None:
             ckpt_data["scheduler"] = scheduler.state_dict()
@@ -778,14 +899,39 @@ def train(
     print(f"Training split/merge  K={K}, M={split_before_end}  "
           f"for {num_train_steps} steps (starting from {start_step})")
     print(f"LR backbone={lr_backbone},  LR projections={lr_projections}")
-    print(f"Scheduler: {scheduler_type}"
-          + (f" (window={plateau_window}, factor={plateau_factor}, threshold={plateau_threshold})"
-             if scheduler_type == "plateau_windowed" else ""))
-    print(f"Loss balancing: {use_loss_balancing}"
-          + (f" (strength={loss_balance_strength}, ema={loss_balance_ema_momentum})"
-             if use_loss_balancing else ""))
+    if scheduler_type == "plateau_windowed":
+        if plateau_signal == "eval_ce":
+            _eff_window_steps = plateau_window_evals * eval_interval
+            _eff_cooldown_steps = plateau_cooldown_evals * eval_interval
+            print(f"Scheduler: {scheduler_type} signal=eval_ce  "
+                  f"window={plateau_window_evals} evals ({_eff_window_steps} steps), "
+                  f"cooldown={plateau_cooldown_evals} evals ({_eff_cooldown_steps} steps), "
+                  f"threshold_abs={plateau_threshold_ce_abs}, factor={plateau_factor}")
+        else:
+            print(f"Scheduler: {scheduler_type} signal=lambada  "
+                  f"window={plateau_window}, factor={plateau_factor}, "
+                  f"threshold={plateau_threshold}")
+    else:
+        print(f"Scheduler: {scheduler_type}")
+    if use_loss_balancing:
+        if balance_signal == "eval_ce":
+            print(f"Loss balancing: eval_ce  strength={loss_balance_strength}, "
+                  f"ema_mom={loss_balance_ema_momentum_eval}, "
+                  f"warmup_evals={loss_balance_warmup_evals}")
+        else:
+            print(f"Loss balancing: train_loss  strength={loss_balance_strength}, "
+                  f"ema_mom={loss_balance_ema_momentum}")
+    else:
+        print("Loss balancing: disabled")
+    if resume_from:
+        print(f"Resume: warmup={resume_warmup_steps} steps, "
+              f"reset_optimizer={resume_reset_optimizer}")
     print(f"Batch size: {batch_size},  grad_accum: {grad_accum},  "
           f"effective batch: {batch_size * grad_accum}")
+    print(f"Manual override: write JSON to {os.path.join(run_dir, 'override.json')} "
+          f"(polled every {override_check_interval} steps)")
+    if checkpoint_last_interval > 0:
+        print(f"Periodic checkpoint_last.pt every {checkpoint_last_interval} steps.")
     print(f"{'='*90}")
 
     if start_step == 0:
@@ -795,6 +941,142 @@ def train(
         for k, v in ev.items():
             writer.add_scalar(f"eval/{k}", v, 0)
 
+    # ------------------------------------------------------------------
+    # Manual-override poller
+    # ------------------------------------------------------------------
+    override_path = os.path.join(run_dir, "override.json")
+    override_applied_log = os.path.join(run_dir, "override_applied.jsonl")
+
+    # Set of keys we know how to apply. Anything else → warning.
+    _OVERRIDABLE_FLOAT = {
+        "lr_backbone", "lr_projections",
+        "balance_alpha", "balance_beta",
+        "plateau_factor", "plateau_threshold_ce_abs",
+    }
+    _OVERRIDABLE_INT = {
+        "plateau_window_evals", "plateau_cooldown_evals",
+        "plateau_cooldown_until",
+        "num_train_steps", "target_last_step",
+    }
+    _OVERRIDABLE_BOOL = {"plateau_enabled", "use_loss_balancing"}
+    _OVERRIDABLE = _OVERRIDABLE_FLOAT | _OVERRIDABLE_INT | _OVERRIDABLE_BOOL
+
+    def _apply_overrides(cur_step: int) -> None:
+        """Read override.json, apply in-place, archive it. No side effects
+        on any state that isn't explicitly named in the file."""
+        nonlocal balance_alpha, balance_beta
+        nonlocal plateau_cooldown_until, plateau_enabled
+        nonlocal plateau_factor, plateau_threshold_ce_abs
+        nonlocal plateau_window_evals, plateau_cooldown_evals
+        nonlocal use_loss_balancing, target_last_step
+        if not os.path.exists(override_path):
+            return
+        try:
+            with open(override_path) as f:
+                ovr = json.load(f)
+        except Exception as e:
+            print(f"\n!! OVERRIDE unreadable at step {cur_step}: {e!r}, leaving file in place\n")
+            return
+        if not isinstance(ovr, dict):
+            print(f"\n!! OVERRIDE must be a JSON object, got {type(ovr)!r}. Skipping.\n")
+            return
+
+        applied: Dict = {}
+        unknown = [k for k in ovr.keys() if k not in _OVERRIDABLE]
+        for k in unknown:
+            print(f"  !! OVERRIDE: unknown key {k!r}, ignored")
+
+        # LR (direct write to optimizer param groups)
+        if "lr_backbone" in ovr:
+            optimizer.param_groups[0]["lr"] = float(ovr["lr_backbone"])
+            applied["lr_backbone"] = float(ovr["lr_backbone"])
+        if "lr_projections" in ovr:
+            optimizer.param_groups[1]["lr"] = float(ovr["lr_projections"])
+            applied["lr_projections"] = float(ovr["lr_projections"])
+
+        # Balance (direct, no EMA touch)
+        if "balance_alpha" in ovr:
+            balance_alpha = float(ovr["balance_alpha"])
+            applied["balance_alpha"] = balance_alpha
+        if "balance_beta" in ovr:
+            balance_beta = float(ovr["balance_beta"])
+            applied["balance_beta"] = balance_beta
+
+        # Plateau behaviour
+        if "plateau_enabled" in ovr:
+            plateau_enabled = bool(ovr["plateau_enabled"])
+            applied["plateau_enabled"] = plateau_enabled
+        if "plateau_factor" in ovr:
+            plateau_factor = float(ovr["plateau_factor"])
+            applied["plateau_factor"] = plateau_factor
+        if "plateau_threshold_ce_abs" in ovr:
+            plateau_threshold_ce_abs = float(ovr["plateau_threshold_ce_abs"])
+            applied["plateau_threshold_ce_abs"] = plateau_threshold_ce_abs
+        if "plateau_window_evals" in ovr:
+            plateau_window_evals = int(ovr["plateau_window_evals"])
+            applied["plateau_window_evals"] = plateau_window_evals
+        if "plateau_cooldown_evals" in ovr:
+            plateau_cooldown_evals = int(ovr["plateau_cooldown_evals"])
+            applied["plateau_cooldown_evals"] = plateau_cooldown_evals
+        if "plateau_cooldown_until" in ovr:
+            plateau_cooldown_until = int(ovr["plateau_cooldown_until"])
+            applied["plateau_cooldown_until"] = plateau_cooldown_until
+
+        # Balancer toggle (EMA keeps updating either way)
+        if "use_loss_balancing" in ovr:
+            use_loss_balancing = bool(ovr["use_loss_balancing"])
+            applied["use_loss_balancing"] = use_loss_balancing
+
+        # Training horizon
+        if "target_last_step" in ovr:
+            target_last_step = int(ovr["target_last_step"])
+            applied["target_last_step"] = target_last_step
+        elif "num_train_steps" in ovr:
+            target_last_step = start_step + int(ovr["num_train_steps"])
+            applied["target_last_step"] = target_last_step
+            applied["num_train_steps"] = int(ovr["num_train_steps"])
+
+        ts = datetime.now().isoformat()
+        print(f"\n== OVERRIDE applied at step {cur_step} (ts={ts}) ==")
+        for k, v in applied.items():
+            print(f"   {k}: {v}")
+        print("=" * 60 + "\n")
+        sys.stdout.flush()
+
+        # Log to TB as a text event (so you can see it in the event timeline)
+        writer.add_text("override", json.dumps(applied), cur_step)
+        # Append to persistent applied-log
+        with open(override_applied_log, "a") as f:
+            f.write(json.dumps({"step": cur_step, "ts": ts, "applied": applied}) + "\n")
+        # Archive so we don't re-apply
+        try:
+            os.rename(override_path, override_path + f".applied_{ts.replace(':','-')}")
+        except OSError as e:
+            print(f"!! couldn't archive override file: {e}, removing instead")
+            try:
+                os.remove(override_path)
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
+    # SIGINT handler: save checkpoint_last before exit
+    # ------------------------------------------------------------------
+    import signal as _signal
+    interrupt_requested = [False]
+
+    def _sigint_handler(signum, frame):
+        if interrupt_requested[0]:
+            print("\n!! Second SIGINT received, hard-exiting.\n", flush=True)
+            sys.exit(130)
+        interrupt_requested[0] = True
+        print("\n!! SIGINT received — will save checkpoint_last and exit after this step. "
+              "Send SIGINT again to force quit.\n", flush=True)
+
+    try:
+        _signal.signal(_signal.SIGINT, _sigint_handler)
+    except ValueError:
+        pass  # not in main thread, ignore
+
     model.train()
     marking.train()
     split_proj.train()
@@ -802,7 +1084,14 @@ def train(
     running_loss = 0.0
     accum_count = 0
 
-    for step in range(start_step + 1, start_step + num_train_steps + 1):
+    target_last_step = start_step + num_train_steps
+    step = start_step
+    while step < target_last_step and not interrupt_requested[0]:
+        step += 1
+        # --- manual override poll (cheap file stat every few steps) ---
+        if override_check_interval > 0 and step % override_check_interval == 0:
+            _apply_overrides(step)
+
         # --- get batch ---
         try:
             ids_a, ids_b = next(train_iter)
@@ -819,11 +1108,20 @@ def train(
         ids_b = ids_b.to(device)
 
         loss, la, lb = _compute_loss(ids_a, ids_b)
-        _update_loss_balancing(la, lb, step)
+        if balance_signal == "train_loss":
+            _update_balance_train_loss(la, lb, step)
         (loss / grad_accum).backward()
         accum_count += 1
 
         if accum_count >= grad_accum:
+            # Apply resume warmup BEFORE optimizer.step() for non-cosine schedulers,
+            # otherwise the very first post-resume step runs with full target LR.
+            if (do_resume_warmup and (step - start_step) <= resume_warmup_steps
+                    and scheduler_type != "cosine"):
+                warmup_factor = (step - start_step) / max(resume_warmup_steps, 1)
+                for i, pg in enumerate(optimizer.param_groups):
+                    pg["lr"] = resume_target_lrs[i] * warmup_factor
+
             nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(marking.parameters()) + list(split_proj.parameters()),
                 max_grad_norm,
@@ -831,13 +1129,12 @@ def train(
             optimizer.step()
             if scheduler_type == "cosine":
                 scheduler.step()
-            if do_resume_warmup and (step - start_step) <= resume_warmup_steps:
-                warmup_factor = (step - start_step) / max(resume_warmup_steps, 1)
-                for i, pg in enumerate(optimizer.param_groups):
-                    if scheduler_type == "cosine":
+                # Cosine initialises LambdaLR at schedule(0)=0, so warmup can
+                # safely be applied *after* optimizer.step() by multiplication.
+                if do_resume_warmup and (step - start_step) <= resume_warmup_steps:
+                    warmup_factor = (step - start_step) / max(resume_warmup_steps, 1)
+                    for i, pg in enumerate(optimizer.param_groups):
                         pg["lr"] *= warmup_factor
-                    else:
-                        pg["lr"] = resume_target_lrs[i] * warmup_factor
             optimizer.zero_grad()
             accum_count = 0
 
@@ -873,6 +1170,45 @@ def train(
             for k, v in ev.items():
                 writer.add_scalar(f"eval/{k}", v, step)
             cur_eval_loss = 0.5 * (ev["ce_a"] + ev["ce_b"])
+
+            # --- Loss balancing from eval CE ---
+            if balance_signal == "eval_ce":
+                _update_balance_eval_ce(ev["ce_a"], ev["ce_b"])
+                writer.add_scalar("train/balance_alpha", balance_alpha, step)
+                writer.add_scalar("train/balance_beta", balance_beta, step)
+                if ema_loss_a is not None:
+                    writer.add_scalar("train/ema_loss_a", ema_loss_a, step)
+                    writer.add_scalar("train/ema_loss_b", ema_loss_b, step)
+
+            # --- Eval-CE-based plateau detector ---
+            if scheduler_type == "plateau_windowed" and plateau_signal == "eval_ce":
+                # Always keep history up to date so it's available if the user
+                # toggles plateau_enabled back on via an override.
+                eval_ce_history.append(cur_eval_loss)
+                w = plateau_window_evals
+                # Only decide if: enabled AND past cooldown AND we have 2 full windows of history
+                if (plateau_enabled
+                        and step >= plateau_cooldown_until
+                        and len(eval_ce_history) >= 2 * w):
+                    recent_mean = float(np.mean(eval_ce_history[-w:]))
+                    previous_mean = float(np.mean(eval_ce_history[-2*w:-w]))
+                    ce_drop = previous_mean - recent_mean   # positive = improved
+                    improved = ce_drop > plateau_threshold_ce_abs
+                    writer.add_scalar("scheduler/recent_ce_mean", recent_mean, step)
+                    writer.add_scalar("scheduler/previous_ce_mean", previous_mean, step)
+                    writer.add_scalar("scheduler/ce_drop", ce_drop, step)
+                    if not improved:
+                        old_lr = optimizer.param_groups[0]["lr"]
+                        for pg in optimizer.param_groups:
+                            pg["lr"] *= plateau_factor
+                        new_lr = optimizer.param_groups[0]["lr"]
+                        plateau_cooldown_until = step + plateau_cooldown_evals * eval_interval
+                        print(f"  -> Plateau(eval_ce): no improvement "
+                              f"(recent={recent_mean:.4f} vs prev={previous_mean:.4f}, "
+                              f"drop={ce_drop:+.4f} < {plateau_threshold_ce_abs:.4f}), "
+                              f"LR {old_lr:.2e} -> {new_lr:.2e}, "
+                              f"cooldown until step {plateau_cooldown_until}")
+
             if cur_eval_loss < best_eval_loss:
                 best_eval_loss = cur_eval_loss
                 best_step = step
@@ -890,7 +1226,8 @@ def train(
                 new_lr = optimizer.param_groups[0]["lr"]
                 if new_lr < old_lr:
                     print(f"  -> ReduceLROnPlateau: LR reduced {old_lr:.2e} -> {new_lr:.2e}")
-            elif scheduler_type == "plateau_windowed":
+            elif (scheduler_type == "plateau_windowed" and plateau_signal == "lambada"
+                    and plateau_enabled):
                 lambada_acc_history.append(lambada_res["acc_avg"])
                 w = plateau_window
                 if len(lambada_acc_history) >= 2 * w:
@@ -912,6 +1249,15 @@ def train(
                         print(f"  -> Windowed plateau: improved "
                               f"(recent={recent_mean:.4f} vs prev={previous_mean:.4f})")
 
+        # --- periodic checkpoint_last.pt (so a crash / SIGINT never wipes >N steps) ---
+        if checkpoint_last_interval > 0 and step % checkpoint_last_interval == 0:
+            tmp_path = os.path.join(run_dir, "checkpoint_last.pt.tmp")
+            final_path = os.path.join(run_dir, "checkpoint_last.pt")
+            _save_checkpoint(tmp_path, step)
+            os.replace(tmp_path, final_path)  # atomic
+            print(f"  -> Saved periodic checkpoint_last.pt at step {step}")
+            sys.stdout.flush()
+
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
@@ -919,14 +1265,22 @@ def train(
     with open(os.path.join(run_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    last_step = start_step + num_train_steps
-    _save_checkpoint(os.path.join(run_dir, "checkpoint_last.pt"), last_step)
+    # Use the actual current step (might be < target_last_step on SIGINT)
+    last_step = step
+    tmp_path = os.path.join(run_dir, "checkpoint_last.pt.tmp")
+    final_path = os.path.join(run_dir, "checkpoint_last.pt")
+    _save_checkpoint(tmp_path, last_step)
+    os.replace(tmp_path, final_path)
 
     # Remove best checkpoint if it's the same step as last (no point keeping both)
     best_path = os.path.join(run_dir, "checkpoint_best.pt")
     if best_step == last_step and os.path.exists(best_path):
         os.remove(best_path)
         print(f"Best checkpoint == last checkpoint (step {last_step}), keeping only last.")
+
+    if interrupt_requested[0]:
+        print(f"\n!! Exited early at step {last_step} due to SIGINT. "
+              f"checkpoint_last.pt saved.\n")
 
     writer.close()
     print(f"\nDone! Results saved to: {run_dir}")
